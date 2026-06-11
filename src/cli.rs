@@ -144,6 +144,17 @@ pub struct Cli {
     #[arg(short = 'm', long = "mode", value_enum)]
     pub mode: Mode,
 
+    /// Convenience: at session init, enslave the guest-facing port (direct: up0,
+    /// fwd: fwd1) into this existing bridge — and do NOTHING else with it. The syncer
+    /// keeps tracking the bridge dynamically via up0.master / fwd1.master, so the
+    /// operator may still detach / re-attach / swap / delete bridges at any time;
+    /// pbridge never fights that. A missing bridge is a warning, not an error (attach
+    /// manually later). Re-applied on re-init (e.g. up0 disappeared and came back —
+    /// in fwd mode the veth pair is recreated then, so it would otherwise sit
+    /// bridge-less until the operator re-attaches).
+    #[arg(short = 'b', long = "bridge")]
+    pub bridge: Option<String>,
+
     /// Log filter: a level (error|warn|info|debug|trace) or an env_logger filter
     /// string (e.g. `pbridge=debug`). The RUST_LOG env var, if set, overrides this.
     #[arg(long = "loglevel", default_value = "info")]
@@ -258,6 +269,7 @@ mod tests {
             interface: "wlan0verylongname".into(),
             engine: Engine::Ebpf,
             mode: Mode::Fwd,
+            bridge: None,
             loglevel: "info".into(),
             fwd_device_if: None,
             fwd_device_br: None,

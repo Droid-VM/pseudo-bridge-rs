@@ -378,7 +378,35 @@ impl Core {
         Ok(())
     }
 
+    /// --bridge convenience: enslave `dev` into the named bridge, once, at session
+    /// init — and nothing more. The syncer's dynamic master tracking is unaffected:
+    /// the operator can detach / re-attach / swap bridges afterwards and pbridge
+    /// follows via netlink as usual. Best-effort: a missing bridge (or dev) only warns.
+    async fn ensure_bridge(&self, dev: &str) {
+        let Some(br_name) = &self.cli.bridge else { return };
+        let br = match self.net.get_link_by_name(br_name).await {
+            Ok(Some(b)) => b,
+            _ => {
+                log::warn!("--bridge {br_name}: no such link; not enslaving {dev} (attach manually)");
+                return;
+            }
+        };
+        let Ok(Some(d)) = self.net.get_link_by_name(dev).await else { return };
+        if d.master == Some(br.index) {
+            return; // already there
+        }
+        match self.net.link_set_master(d.index, br.index).await {
+            Ok(()) => log::info!("--bridge: enslaved {dev} into {br_name}"),
+            Err(e) => log::warn!("--bridge: enslave {dev} into {br_name}: {e:#}"),
+        }
+    }
+
     async fn init_session(&mut self) -> Result<()> {
+        // direct: the guest-facing port that joins the bridge is up0 itself.
+        if !self.is_fwd() {
+            let up0 = self.cli.interface.clone();
+            self.ensure_bridge(&up0).await;
+        }
         let snap = self.recompute().await?;
         if !snap.up0_present {
             return Ok(());
@@ -416,6 +444,8 @@ impl Core {
             if fwd0_index.is_none() {
                 anyhow::bail!("fwd mode: could not create/resolve fwd0 {}", fwd0);
             }
+            // fwd: the guest-facing port is fwd1 (just recreated, so never enslaved yet).
+            self.ensure_bridge(&fwd1).await;
         }
 
         // recompute again to pick up fwd0's index / any master already present.

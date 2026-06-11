@@ -23,11 +23,12 @@ fn main() -> Result<()> {
         .init();
 
     log::info!(
-        "pbridge start: if={} engine={:?} mode={:?} fwd0={} fwd1={} nflog-group={} timeout={}s \
+        "pbridge start: if={} engine={:?} mode={:?} bridge={:?} fwd0={} fwd1={} nflog-group={} timeout={}s \
          offload-workaround={:?} arp-keepalive={}s loglevel={}",
         cli.interface,
         cli.engine,
         cli.mode,
+        cli.bridge,
         cli.fwd0(),
         cli.fwd1(),
         cli.nflog_group,

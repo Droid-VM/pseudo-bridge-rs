@@ -182,6 +182,12 @@ impl Net {
         self.handle.link().set(msg).execute().await.context("link_set_up")
     }
 
+    /// Enslave a link into a bridge (`ip link set <dev> master <br>`).
+    pub async fn link_set_master(&self, index: u32, master: u32) -> Result<()> {
+        let msg = LinkUnspec::new_with_index(index).controller(master).build();
+        self.handle.link().set(msg).execute().await.context("link_set_master")
+    }
+
     /// Create a veth pair (idempotent: ignores EEXIST).
     pub async fn create_veth(&self, a: &str, b: &str) -> Result<()> {
         match self

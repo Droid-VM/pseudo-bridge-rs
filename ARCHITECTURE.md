@@ -18,6 +18,9 @@ multi-guest 共用一個「只認得單一 mac」的上游口(Wi-Fi STA、或被
     -i  --interface         上游網卡,下文簡稱 up0
     -e  --offload-engine    nft | ebpf
     -m  --mode              direct | fwd | fwd-with-offload(= fwd + ND/ARP offload 繞道預設開 v4,v6;見 §ND/ARP offload 繞道)
+    -b  --bridge            便利參數:session init 時把面向 guest 的口(direct=up0、fwd=fwd1)enslave 進這個**既有** bridge,僅此而已。
+                            br 的探測完全不用這個參數(仍動態追蹤 up0.master / fwd1.master),操作者事後解綁/換綁/刪 bridge/重綁照常;
+                            bridge 不存在只 warn 不 error。re-init(up0 消失又出現,fwd 的 veth 會重建)時重套一次
     -fi --fwd-device-if     fwd mode 的 veth 名稱,下文簡稱 fwd0(預設 {ifname[:12]}-if)
     -fb --fwd-device-br     fwd mode 的 veth 名稱,下文簡稱 fwd1(預設 {ifname[:12]}-br)
         --nflog-group       nft NFLOG group(下文 <g>);預設 32123
@@ -37,6 +40,7 @@ multi-guest 共用一個「只認得單一 mac」的上游口(Wi-Fi STA、或被
     fwd0/fwd1 fwd mode 用的 veth pair(pbridge 建並 up,但**不碰 bridge**);fwd1 由操作者 enslave 進 bridge(面向 guest)、fwd0 pbridge 獨佔
               兩端都設成**純 L2 transport**:`addr_gen_mode=1`(不自生 LL)+ `accept_ra=0`,且不綁任何位址——只讓封包通過,不跑自己的 ND/RS
     br        **唯一 pin 的是 up0**;br 不固定指定,而是動態追蹤(direct=`up0.master`、fwd=`fwd1.master`)。操作者可隨時 attach/換/detach,rust netlink 監測即時跟上
+              (`--bridge` 只是 init 時代勞 enslave 一次的便利參數,探測不依賴它;見 §cli 參數)
     entry     ip → { mac, createat }:「某 guest ip 屬於哪個 guest mac」。createat 供 caps FIFO 驅逐;衝突由 syncer 同步時自動跳過
     HOSTMAC   出向所有 guest 封包的 src mac。 = (direct && up0 有 master)? master(bridge) mac : up0 mac。rust netlink 動態監測(隨 MAC randomization / roaming 變)
     host_ips  host 自有 IP = up0.IPs ∪ (有 master 時) master.IPs。用途:in 方向「提早 accept」放行 host 自己的封包(hostip 最優先,vm 用相同 IP 會被無視)。rust netlink 動態監測
@@ -458,6 +462,7 @@ syncer 是**唯一寫/撤 kernel offload 狀態的人**。維護兩份 state、�
 **syncer 實際安裝/撤除的 kernel 狀態(每個動作對應的 netlink/offload 寫入)**:
 
     init session(fwd)      : create_veth(fwd0,fwd1) + disable_dev_autoconf 兩端(addr_gen_mode=1,accept_ra=0,刪 auto LL)+ link up
+                             →(`--bridge` 時 enslave fwd1 一次;direct 則在 init 最前 enslave up0——之後仍純動態追蹤)
                              → backend.init(注入器+offload 規則)→ ensure_vmroute_rules(`iif lo`,見下)→ reconcile_mirror → reconcile_all
     reconcile(ip) write    : backend.write_entry(ip,mac)= ip2mac/valid + seen=alive
                              (fwd 且非 link-local 且 --vmroute-table≠-1) route_add(ip/{32|128} dev=br_index,prefsrc=select_src(ip,host_ips),table=vmroute-table)
