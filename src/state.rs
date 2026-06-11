@@ -23,8 +23,9 @@ pub struct Entries {
     cap: MaxCap,
 }
 
-/// Outcome of a learn() call: which IPs changed and therefore need reconcile.
-/// `evicted` are removed (reconcile will withdraw); `added` is the new/updated ip.
+/// Outcome of a learn() call: every IP that changed and therefore needs reconcile —
+/// the new/updated ip plus any evicted victims (reconcile withdraws those, since
+/// they're no longer in the store).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct LearnResult {
     pub changed: Vec<IpAddr>,

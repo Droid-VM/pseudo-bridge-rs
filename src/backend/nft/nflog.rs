@@ -3,13 +3,13 @@
 //! NFULA_HWADDR = original guest src mac; NFULA_HWHEADER = full L2 header (ethertype at
 //! bytes 12..14); NFULA_PAYLOAD = L3; NFULA_PREFIX "R" => reinject (ND drop path).
 
-use crate::backend::CopyEvent;
+use crate::backend::{push_copy, CopyEvent};
 use crate::types::Mac;
 use anyhow::{Context, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 const NETLINK_NETFILTER: i32 = 12;
 const NFNL_SUBSYS_ULOG: u16 = 4;
@@ -49,7 +49,7 @@ fn config_msg(group: u16, seq: u32, attr: &[u8]) -> Vec<u8> {
     let total = 16 + body.len();
     let mut v = Vec::with_capacity(align4(total));
     v.extend_from_slice(&(total as u32).to_ne_bytes());
-    v.extend_from_slice(&(((NFNL_SUBSYS_ULOG << 8) | NFULNL_MSG_CONFIG)).to_ne_bytes());
+    v.extend_from_slice(&((NFNL_SUBSYS_ULOG << 8) | NFULNL_MSG_CONFIG).to_ne_bytes());
     v.extend_from_slice(&NLM_F_REQUEST.to_ne_bytes());
     v.extend_from_slice(&seq.to_ne_bytes());
     v.extend_from_slice(&0u32.to_ne_bytes());
@@ -75,7 +75,7 @@ fn parse_attrs(buf: &[u8]) -> Vec<(u16, &[u8])> {
     out
 }
 
-pub fn spawn_reader(group: u16, stop: Arc<AtomicBool>, tx: UnboundedSender<CopyEvent>) -> Result<()> {
+pub fn spawn_reader(group: u16, stop: Arc<AtomicBool>, tx: Sender<CopyEvent>) -> Result<()> {
     // SAFETY: FFI socket() with constant args; the returned fd is fresh/unowned on success
     // so OwnedFd takes sole ownership (closed on drop). Not built on failure.
     let raw = unsafe {
@@ -120,6 +120,7 @@ pub fn spawn_reader(group: u16, stop: Arc<AtomicBool>, tx: UnboundedSender<CopyE
         .name("nflog-reader".into())
         .spawn(move || {
             let mut buf = vec![0u8; 1 << 17];
+            let mut dropped = 0u64;
             loop {
                 if stop.load(Ordering::SeqCst) {
                     break;
@@ -143,7 +144,7 @@ pub fn spawn_reader(group: u16, stop: Arc<AtomicBool>, tx: UnboundedSender<CopyE
                     if (mtype >> 8) == NFNL_SUBSYS_ULOG && (mtype & 0xff) == NFULNL_MSG_PACKET {
                         // skip nfgenmsg (4 bytes) then attrs
                         if let Some(ev) = parse_packet(&buf[off + 20..off + mlen]) {
-                            let _ = tx.send(ev);
+                            push_copy(&tx, ev, &mut dropped);
                         }
                     }
                     off += align4(mlen);

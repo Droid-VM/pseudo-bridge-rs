@@ -90,9 +90,11 @@ pub const NFTA_IMMEDIATE_DATA: u16 = 2;
 pub const NFTA_LOOKUP_SET: u16 = 1;
 pub const NFTA_LOOKUP_SREG: u16 = 2;
 pub const NFTA_LOOKUP_DREG: u16 = 3;
+pub const NFTA_LOOKUP_SET_ID: u16 = 4;
 pub const NFTA_LOOKUP_FLAGS: u16 = 5;
 
 pub const NFTA_DYNSET_SET_NAME: u16 = 1;
+pub const NFTA_DYNSET_SET_ID: u16 = 2;
 pub const NFTA_DYNSET_OP: u16 = 3;
 pub const NFTA_DYNSET_SREG_KEY: u16 = 4;
 pub const NFTA_DYNSET_SREG_DATA: u16 = 5;
@@ -263,8 +265,16 @@ pub fn verdict(code: u32, chain: Option<&str>) -> Vec<u8> {
     expr("immediate", &cat(&[nla_be32(NFTA_IMMEDIATE_DREG, NFT_REG_VERDICT), data]))
 }
 
-pub fn lookup(set: &str, sreg: u32, dreg: Option<u32>) -> Vec<u8> {
-    let mut parts = vec![nla_str(NFTA_LOOKUP_SET, set), nla_be32(NFTA_LOOKUP_SREG, sreg)];
+/// Set lookup. `set_id` is the NFTA_SET_ID assigned at set creation: rules are
+/// installed in the *same* batch as their sets (atomic table swap), where a by-name
+/// lookup can't see the not-yet-committed set — the kernel resolves same-batch
+/// references via NFTA_LOOKUP_SET_ID instead (the name is still sent for listing).
+pub fn lookup(set: &str, set_id: u32, sreg: u32, dreg: Option<u32>) -> Vec<u8> {
+    let mut parts = vec![
+        nla_str(NFTA_LOOKUP_SET, set),
+        nla_be32(NFTA_LOOKUP_SET_ID, set_id),
+        nla_be32(NFTA_LOOKUP_SREG, sreg),
+    ];
     if let Some(d) = dreg {
         parts.push(nla_be32(NFTA_LOOKUP_DREG, d));
     }
@@ -272,21 +282,23 @@ pub fn lookup(set: &str, sreg: u32, dreg: Option<u32>) -> Vec<u8> {
 }
 
 /// Inverted membership test: matches when `sreg`'s value is NOT a key of `set`/map.
-pub fn lookup_inv(set: &str, sreg: u32) -> Vec<u8> {
+pub fn lookup_inv(set: &str, set_id: u32, sreg: u32) -> Vec<u8> {
     const NFT_LOOKUP_F_INV: u32 = 1;
     expr(
         "lookup",
         &cat(&[
             nla_str(NFTA_LOOKUP_SET, set),
+            nla_be32(NFTA_LOOKUP_SET_ID, set_id),
             nla_be32(NFTA_LOOKUP_SREG, sreg),
             nla_be32(NFTA_LOOKUP_FLAGS, NFT_LOOKUP_F_INV),
         ]),
     )
 }
 
-pub fn dynset_update(set: &str, sreg_key: u32, timeout_ms: Option<u64>) -> Vec<u8> {
+pub fn dynset_update(set: &str, set_id: u32, sreg_key: u32, timeout_ms: Option<u64>) -> Vec<u8> {
     let mut parts = vec![
         nla_str(NFTA_DYNSET_SET_NAME, set),
+        nla_be32(NFTA_DYNSET_SET_ID, set_id),
         nla_be32(NFTA_DYNSET_OP, NFT_DYNSET_OP_UPDATE),
         nla_be32(NFTA_DYNSET_SREG_KEY, sreg_key),
     ];
@@ -454,7 +466,16 @@ impl NlSock {
         while acks < acks_expected {
             let n = match self.recv(&mut rbuf) {
                 Ok(n) => n,
-                Err(_) => break, // timeout: assume remaining acks ok
+                Err(e) => {
+                    // Timed out waiting for acks. The kernel may still have applied the
+                    // batch; we can't tell from here, so log loudly instead of failing.
+                    log::warn!(
+                        "nft transaction: {}/{} acks then recv error ({e:#}); assuming applied",
+                        acks,
+                        acks_expected
+                    );
+                    break;
+                }
             };
             let mut off = 0;
             while off + 16 <= n {
@@ -518,10 +539,9 @@ impl NlSock {
         let mut out = Vec::new();
         let mut rbuf = vec![0u8; 65536];
         'outer: loop {
-            let n = match self.recv(&mut rbuf) {
-                Ok(n) => n,
-                Err(_) => break,
-            };
+            // A recv error mid-dump must NOT yield a partial result: the caller ages out
+            // anything missing from it, so a truncated alive-set would evict live entries.
+            let n = self.recv(&mut rbuf).context("dump_set_elems recv")?;
             let mut off = 0;
             while off + 16 <= n {
                 let mlen = u32::from_ne_bytes(rbuf[off..off + 4].try_into().unwrap()) as usize;

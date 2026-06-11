@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use wire::*;
 
 const TABLE: &str = "pbridge";
@@ -24,6 +24,18 @@ const CH_NDOUT: &str = "nd_out";
 const CH_OUT: &str = "out";
 const CH_IN: &str = "in";
 const CH_GUARD: &str = "egress_guard";
+
+// NFTA_SET_ID handles. Rules are created in the same atomic batch as their sets
+// (see build_table), where a by-name set reference can't resolve yet — the kernel
+// resolves same-batch references by id (wire::lookup / dynset_update send both).
+const SID_IP2MAC4: u32 = 1;
+const SID_IP2MAC6: u32 = 2;
+const SID_VALID4: u32 = 3;
+const SID_VALID6: u32 = 4;
+const SID_HOST4: u32 = 5;
+const SID_HOST6: u32 = 6;
+const SID_SEEN4: u32 = 7;
+const SID_SEEN6: u32 = 8;
 
 // header offsets
 const LL_DST: u32 = 0;
@@ -63,6 +75,9 @@ pub struct NftBackend {
     entries: HashMap<IpAddr, Mac>,
     sock: Option<NlSock>,
     reader_stop: Option<Arc<AtomicBool>>,
+    /// Whether our table is currently installed (drives the atomic delete+create swap
+    /// in rebuild vs a fresh build).
+    table_installed: bool,
 }
 
 impl NftBackend {
@@ -76,6 +91,7 @@ impl NftBackend {
             entries: HashMap::new(),
             sock: None,
             reader_stop: None,
+            table_installed: false,
         }
     }
 
@@ -87,11 +103,29 @@ impl NftBackend {
         self.cfg.as_ref().ok_or_else(|| anyhow::anyhow!("nft not initialized"))
     }
 
-    /// Delete the table (best effort), then build it fresh with current literals.
+    /// Rebuild the table to the current literals (HOSTMAC/BRMAC/mode) and re-flash all
+    /// shadow elements. The ruleset swap is a single atomic batch (delete-old + create-new
+    /// commit together), so traffic never sees a missing or partially-installed ruleset —
+    /// critical in direct mode, where a gap on the up0 egress hook would leak guest src
+    /// macs upstream (case 13).
     fn rebuild(&mut self) -> Result<()> {
-        self.delete_table_best_effort();
-        self.build_table()?;
-        // re-flash shadow elements
+        if self.table_installed {
+            // Atomic swap. If it fails (e.g. someone deleted our table externally, making
+            // the in-batch DELTABLE abort the whole batch), fall back to a fresh build.
+            if let Err(e) = self.build_table(true) {
+                log::warn!("nft atomic rebuild failed ({e:#}); retrying as fresh build");
+                self.table_installed = false;
+            }
+        }
+        if !self.table_installed {
+            self.delete_table_best_effort(); // clear any stale table (crashed run)
+            self.build_table(false)?;
+        }
+        self.table_installed = true;
+        // Re-flash shadow elements in follow-up transactions. The gap is fail-safe: with
+        // the full ruleset in place, empty sets only mean OUT falls through to the else
+        // row (which still normalizes src to HOSTMAC) and IN demux misses accept to the
+        // host stack — no leak, just a brief demux outage until the elements land.
         let host4: Vec<Ipv4Addr> = self.host4.iter().copied().collect();
         let host6: Vec<Ipv6Addr> = self.host6.iter().copied().collect();
         for ip in host4 {
@@ -122,42 +156,18 @@ impl NftBackend {
         }
     }
 
-    fn build_table(&mut self) -> Result<()> {
+    /// Build the complete table — table + sets + chains + every rule — in ONE batch,
+    /// optionally preceded by a delete of the old table (`replace`). nf_tables commits
+    /// a batch atomically, so the datapath flips from the old ruleset to the new one
+    /// with no window of missing/partial rules. Rule errors are pinpointed by the
+    /// reported seq + extack instead of per-rule transactions.
+    fn build_table(&mut self, replace: bool) -> Result<()> {
         let cfg = self.cfg()?.clone();
         let hostmac = self.hostmac;
         let brmac = self.brmac;
         let group = cfg.nflog_group;
 
-        // Phase 1: table + sets + chains (one transaction).
-        let sock = self.sock.as_mut().ok_or_else(|| anyhow::anyhow!("no sock"))?;
-        sock.transaction(|ts| {
-            let mut msgs = Vec::new();
-            msgs.push(nft_message(NFT_MSG_NEWTABLE, NLM_F_CREATE, ts.seq(), NFPROTO_NETDEV, &nla_str(NFTA_TABLE_NAME, TABLE)));
-            msgs.push(set_msg(ts.seq(), "ip2mac4", DT_IP4, 4, SetKind::Map(6), 1));
-            msgs.push(set_msg(ts.seq(), "ip2mac6", DT_IP6, 16, SetKind::Map(6), 2));
-            msgs.push(set_msg(ts.seq(), "valid4", (DT_IP4 << 6) | DT_ETHER, 12, SetKind::Concat(&[4, 6]), 3));
-            msgs.push(set_msg(ts.seq(), "valid6", (DT_IP6 << 6) | DT_ETHER, 24, SetKind::Concat(&[16, 6]), 4));
-            msgs.push(set_msg(ts.seq(), "host4", DT_IP4, 4, SetKind::Plain, 5));
-            msgs.push(set_msg(ts.seq(), "host6", DT_IP6, 16, SetKind::Plain, 6));
-            msgs.push(set_msg(ts.seq(), "seen4", DT_IP4, 4, SetKind::Dynamic(cfg.timeout), 7));
-            msgs.push(set_msg(ts.seq(), "seen6", DT_IP6, 16, SetKind::Dynamic(cfg.timeout), 8));
-            msgs.push(chain_msg(ts.seq(), CH_NDOUT, None));
-            let (out_hook, in_hook) = match cfg.mode {
-                Mode::Fwd | Mode::FwdOffload => (NF_NETDEV_INGRESS, NF_NETDEV_INGRESS),
-                Mode::Direct => (NF_NETDEV_EGRESS, NF_NETDEV_INGRESS),
-            };
-            let out_dev = match cfg.mode {
-                Mode::Fwd | Mode::FwdOffload => cfg.fwd0.clone().unwrap_or_default(),
-                Mode::Direct => cfg.up0.clone(),
-            };
-            msgs.push(chain_msg(ts.seq(), CH_OUT, Some(Hook { hooknum: out_hook, prio: -300, dev: &out_dev })));
-            msgs.push(chain_msg(ts.seq(), CH_IN, Some(Hook { hooknum: in_hook, prio: -300, dev: &cfg.up0 })));
-            msgs.push(chain_msg(ts.seq(), CH_GUARD, Some(Hook { hooknum: NF_NETDEV_EGRESS, prio: 0, dev: &cfg.up0 })));
-            msgs
-        })?;
-
-        // Phase 2: rules (each in its own transaction so an error pinpoints it,
-        // and APPEND preserves order across transactions).
+        // Rules in final order (NLM_F_APPEND within the batch preserves it).
         let mut rules: Vec<(&str, Vec<Vec<u8>>)> = Vec::new();
         for r in nd_out_rules(hostmac, group) {
             rules.push((CH_NDOUT, r));
@@ -191,14 +201,39 @@ impl NftBackend {
             rules.push((CH_GUARD, guard_ns_discover(fwd0)));
         }
 
+        let (out_hook, in_hook) = match cfg.mode {
+            Mode::Fwd | Mode::FwdOffload => (NF_NETDEV_INGRESS, NF_NETDEV_INGRESS),
+            Mode::Direct => (NF_NETDEV_EGRESS, NF_NETDEV_INGRESS),
+        };
+        let out_dev = match cfg.mode {
+            Mode::Fwd | Mode::FwdOffload => cfg.fwd0.clone().unwrap_or_default(),
+            Mode::Direct => cfg.up0.clone(),
+        };
+
         let sock = self.sock.as_mut().ok_or_else(|| anyhow::anyhow!("no sock"))?;
-        for (i, (chain, exprs)) in rules.into_iter().enumerate() {
-            let r = sock.transaction(|ts| vec![rule_msg(ts.seq(), chain, exprs)]);
-            if let Err(e) = r {
-                anyhow::bail!("rule #{i} in chain {chain} failed: {e:#}");
+        sock.transaction(|ts| {
+            let mut msgs = Vec::new();
+            if replace {
+                msgs.push(nft_message(NFT_MSG_DELTABLE, 0, ts.seq(), NFPROTO_NETDEV, &nla_str(NFTA_TABLE_NAME, TABLE)));
             }
-        }
-        Ok(())
+            msgs.push(nft_message(NFT_MSG_NEWTABLE, NLM_F_CREATE, ts.seq(), NFPROTO_NETDEV, &nla_str(NFTA_TABLE_NAME, TABLE)));
+            msgs.push(set_msg(ts.seq(), "ip2mac4", DT_IP4, 4, SetKind::Map(6), SID_IP2MAC4));
+            msgs.push(set_msg(ts.seq(), "ip2mac6", DT_IP6, 16, SetKind::Map(6), SID_IP2MAC6));
+            msgs.push(set_msg(ts.seq(), "valid4", (DT_IP4 << 6) | DT_ETHER, 12, SetKind::Concat(&[4, 6]), SID_VALID4));
+            msgs.push(set_msg(ts.seq(), "valid6", (DT_IP6 << 6) | DT_ETHER, 24, SetKind::Concat(&[16, 6]), SID_VALID6));
+            msgs.push(set_msg(ts.seq(), "host4", DT_IP4, 4, SetKind::Plain, SID_HOST4));
+            msgs.push(set_msg(ts.seq(), "host6", DT_IP6, 16, SetKind::Plain, SID_HOST6));
+            msgs.push(set_msg(ts.seq(), "seen4", DT_IP4, 4, SetKind::Dynamic(cfg.timeout), SID_SEEN4));
+            msgs.push(set_msg(ts.seq(), "seen6", DT_IP6, 16, SetKind::Dynamic(cfg.timeout), SID_SEEN6));
+            msgs.push(chain_msg(ts.seq(), CH_NDOUT, None));
+            msgs.push(chain_msg(ts.seq(), CH_OUT, Some(Hook { hooknum: out_hook, prio: -300, dev: &out_dev })));
+            msgs.push(chain_msg(ts.seq(), CH_IN, Some(Hook { hooknum: in_hook, prio: -300, dev: &cfg.up0 })));
+            msgs.push(chain_msg(ts.seq(), CH_GUARD, Some(Hook { hooknum: NF_NETDEV_EGRESS, prio: 0, dev: &cfg.up0 })));
+            for (chain, exprs) in rules {
+                msgs.push(rule_msg(ts.seq(), chain, exprs));
+            }
+            msgs
+        })
     }
 
     fn add_host(&mut self, ip: IpAddr) -> Result<()> {
@@ -284,7 +319,7 @@ impl Backend for NftBackend {
         "nft"
     }
 
-    fn init(&mut self, cfg: &InitCfg, copy_tx: UnboundedSender<CopyEvent>) -> Result<()> {
+    fn init(&mut self, cfg: &InitCfg, copy_tx: Sender<CopyEvent>) -> Result<()> {
         self.cfg = Some(cfg.clone());
         self.hostmac = cfg.hostmac;
         self.brmac = cfg.brmac;
@@ -301,6 +336,7 @@ impl Backend for NftBackend {
             }
         }
         self.sock = Some(NlSock::open()?);
+        self.table_installed = false; // fresh session: rebuild clears any stale table
         self.rebuild()?;
         // start NFLOG reader
         let stop = Arc::new(AtomicBool::new(false));
@@ -314,6 +350,7 @@ impl Backend for NftBackend {
             stop.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         self.delete_table_best_effort();
+        self.table_installed = false;
         self.sock = None;
         self.cfg = None;
         Ok(())
@@ -456,7 +493,7 @@ fn nd_out_rules(hostmac: Mac, group: u16) -> Vec<Vec<Vec<u8>>> {
         e.push(payload_set(NFT_PAYLOAD_TRANSPORT_HEADER, lla_off, 6, NFT_REG_1, None));
         // mark seen (ip6 saddr)
         e.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, V6_SADDR, 16, NFT_REG_1));
-        e.push(dynset_update("seen6", NFT_REG_1, None));
+        e.push(dynset_update("seen6", SID_SEEN6, NFT_REG_1, None));
         e.push(log(group, "R"));
         e.push(verdict(NF_DROP, None));
         e
@@ -495,9 +532,9 @@ fn dhcp_rule(hostmac: Mac, term: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
 
 fn valid_rule(fam: Family, hostmac: Mac, term: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     let mut e = Vec::new();
-    let (eth, saddr, set, seen) = match fam {
-        Family::V4 => (ETH_IP4, V4_SADDR, "valid4", "seen4"),
-        Family::V6 => (ETH_IP6, V6_SADDR, "valid6", "seen6"),
+    let (eth, saddr, set, sid, seen, seen_sid) = match fam {
+        Family::V4 => (ETH_IP4, V4_SADDR, "valid4", SID_VALID4, "seen4", SID_SEEN4),
+        Family::V6 => (ETH_IP6, V6_SADDR, "valid6", SID_VALID6, "seen6", SID_SEEN6),
     };
     let slen = if fam == Family::V4 { 4 } else { 16 };
     e.extend(eth_gate(eth));
@@ -507,10 +544,10 @@ fn valid_rule(fam: Family, hostmac: Mac, term: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     let field2 = if fam == Family::V4 { NFT_REG32_01 } else { NFT_REG_2 };
     e.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, saddr, slen, NFT_REG_1));
     e.push(payload_load(NFT_PAYLOAD_LL_HEADER, LL_SRC, 6, field2));
-    e.push(lookup(set, NFT_REG_1, None));
+    e.push(lookup(set, sid, NFT_REG_1, None));
     // mark seen (reload ip saddr)
     e.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, saddr, slen, NFT_REG_1));
-    e.push(dynset_update(seen, NFT_REG_1, None));
+    e.push(dynset_update(seen, seen_sid, NFT_REG_1, None));
     e.extend(set_src_hostmac(hostmac));
     e.extend(term);
     e
@@ -525,7 +562,7 @@ fn arp_out_rule(hostmac: Mac, group: u16, term: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     e.push(payload_set(NFT_PAYLOAD_NETWORK_HEADER, 8, 6, NFT_REG_1, None));
     // mark seen (arp spa)
     e.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, ARP_SPA, 4, NFT_REG_1));
-    e.push(dynset_update("seen4", NFT_REG_1, None));
+    e.push(dynset_update("seen4", SID_SEEN4, NFT_REG_1, None));
     e.push(log(group, "L"));
     e.extend(set_src_hostmac(hostmac));
     e.extend(term);
@@ -533,8 +570,7 @@ fn arp_out_rule(hostmac: Mac, group: u16, term: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
 }
 
 fn else_out_rule(hostmac: Mac, group: u16, term: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-    let mut e = Vec::new();
-    e.push(log(group, "L"));
+    let mut e = vec![log(group, "L")];
     e.extend(set_src_hostmac(hostmac));
     e.extend(term);
     e
@@ -549,8 +585,7 @@ fn drop_src(mac: Mac) -> Vec<Vec<u8>> {
 }
 
 fn out_rules_fwd(hostmac: Mac, brmac: Option<Mac>, group: u16, up0: u32) -> Vec<Vec<Vec<u8>>> {
-    let mut rules = Vec::new();
-    rules.push(drop_src(hostmac));
+    let mut rules = vec![drop_src(hostmac)];
     if let Some(b) = brmac {
         rules.push(drop_src(b));
     }
@@ -564,13 +599,12 @@ fn out_rules_fwd(hostmac: Mac, brmac: Option<Mac>, group: u16, up0: u32) -> Vec<
 }
 
 fn out_rules_direct(hostmac: Mac, group: u16) -> Vec<Vec<Vec<u8>>> {
-    let mut rules = Vec::new();
     // row1: src==HOSTMAC accept (host / reinject)
-    rules.push(vec![
+    let mut rules = vec![vec![
         payload_load(NFT_PAYLOAD_LL_HEADER, LL_SRC, 6, NFT_REG_1),
         cmp(NFT_REG_1, NFT_CMP_EQ, hostmac.bytes()),
         verdict(NF_ACCEPT, None),
-    ]);
+    ]];
     rules.push(dhcp_rule(hostmac, term_accept()));
     rules.push(nd_dispatch());
     rules.push(valid_rule(Family::V4, hostmac, term_accept()));
@@ -590,34 +624,34 @@ fn in_host_rules(hostmac: Mac) -> Vec<Vec<Vec<u8>>> {
     let mut r = eth_dst_is(hostmac);
     r.extend(eth_gate(ETH_IP4));
     r.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, V4_DADDR, 4, NFT_REG_1));
-    r.push(lookup("host4", NFT_REG_1, None));
+    r.push(lookup("host4", SID_HOST4, NFT_REG_1, None));
     r.push(verdict(NF_ACCEPT, None));
     rules.push(r);
     // ether daddr==HOSTMAC ip6 daddr @host6 accept
     let mut r = eth_dst_is(hostmac);
     r.extend(eth_gate(ETH_IP6));
     r.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, V6_DADDR, 16, NFT_REG_1));
-    r.push(lookup("host6", NFT_REG_1, None));
+    r.push(lookup("host6", SID_HOST6, NFT_REG_1, None));
     r.push(verdict(NF_ACCEPT, None));
     rules.push(r);
     // arp tpa @host4 accept
     let mut r = eth_gate(ETH_ARP);
     r.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, ARP_TPA, 4, NFT_REG_1));
-    r.push(lookup("host4", NFT_REG_1, None));
+    r.push(lookup("host4", SID_HOST4, NFT_REG_1, None));
     r.push(verdict(NF_ACCEPT, None));
     rules.push(r);
     rules
 }
 
 fn in_demux_ip(fam: Family, hostmac: Mac, term: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-    let (eth, daddr, dlen, map) = match fam {
-        Family::V4 => (ETH_IP4, V4_DADDR, 4u32, "ip2mac4"),
-        Family::V6 => (ETH_IP6, V6_DADDR, 16u32, "ip2mac6"),
+    let (eth, daddr, dlen, map, sid) = match fam {
+        Family::V4 => (ETH_IP4, V4_DADDR, 4u32, "ip2mac4", SID_IP2MAC4),
+        Family::V6 => (ETH_IP6, V6_DADDR, 16u32, "ip2mac6", SID_IP2MAC6),
     };
     let mut r = eth_dst_is(hostmac);
     r.extend(eth_gate(eth));
     r.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, daddr, dlen, NFT_REG_1));
-    r.push(lookup(map, NFT_REG_1, Some(NFT_REG_1))); // key reg1 -> mac reg1
+    r.push(lookup(map, sid, NFT_REG_1, Some(NFT_REG_1))); // key reg1 -> mac reg1
     r.push(payload_set(NFT_PAYLOAD_LL_HEADER, LL_DST, 6, NFT_REG_1, None));
     r.extend(term);
     r
@@ -627,7 +661,7 @@ fn in_demux_arp(hostmac: Mac, term: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     let mut r = eth_dst_is(hostmac);
     r.extend(eth_gate(ETH_ARP));
     r.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, ARP_TPA, 4, NFT_REG_1));
-    r.push(lookup("ip2mac4", NFT_REG_1, Some(NFT_REG_1)));
+    r.push(lookup("ip2mac4", SID_IP2MAC4, NFT_REG_1, Some(NFT_REG_1)));
     // set arp tha + eth dst
     r.push(payload_set(NFT_PAYLOAD_NETWORK_HEADER, ARP_THA, 6, NFT_REG_1, None));
     r.push(payload_set(NFT_PAYLOAD_LL_HEADER, LL_DST, 6, NFT_REG_1, None));
@@ -676,7 +710,7 @@ fn guard_arp_discover(fwd0: u32) -> Vec<Vec<u8>> {
     e.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, ARP_OP, 2, NFT_REG_1));
     e.push(cmp(NFT_REG_1, NFT_CMP_EQ, &1u16.to_be_bytes())); // request
     e.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, ARP_SPA, 4, NFT_REG_1));
-    e.push(lookup_inv("ip2mac4", NFT_REG_1)); // sender IP not a learned guest
+    e.push(lookup_inv("ip2mac4", SID_IP2MAC4, NFT_REG_1)); // sender IP not a learned guest
     e.extend(term_dup(fwd0));
     e
 }
@@ -689,18 +723,18 @@ fn guard_ns_discover(fwd0: u32) -> Vec<Vec<u8>> {
     e.push(cmp(NFT_REG_1, NFT_CMP_EQ, &[135])); // NS
     e.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, V6_SADDR, 16, NFT_REG_1));
     e.push(cmp(NFT_REG_1, NFT_CMP_NEQ, &[0u8; 16])); // not DAD (src != ::)
-    e.push(lookup_inv("ip2mac6", NFT_REG_1)); // source not a learned guest
+    e.push(lookup_inv("ip2mac6", SID_IP2MAC6, NFT_REG_1)); // source not a learned guest
     e.extend(term_dup(fwd0));
     e
 }
 
 fn guard_rule(hostmac: Mac) -> Vec<Vec<u8>> {
-    let mut e = Vec::new();
-    e.push(payload_load(NFT_PAYLOAD_LL_HEADER, LL_SRC, 6, NFT_REG_1));
-    e.push(cmp(NFT_REG_1, NFT_CMP_NEQ, hostmac.bytes()));
-    e.push(immediate_data(NFT_REG_1, hostmac.bytes()));
-    e.push(payload_set(NFT_PAYLOAD_LL_HEADER, LL_SRC, 6, NFT_REG_1, None));
-    e
+    vec![
+        payload_load(NFT_PAYLOAD_LL_HEADER, LL_SRC, 6, NFT_REG_1),
+        cmp(NFT_REG_1, NFT_CMP_NEQ, hostmac.bytes()),
+        immediate_data(NFT_REG_1, hostmac.bytes()),
+        payload_set(NFT_PAYLOAD_LL_HEADER, LL_SRC, 6, NFT_REG_1, None),
+    ]
 }
 
 // ===== message assembly (pbridge-specific; table = TABLE) =====

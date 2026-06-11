@@ -5,7 +5,7 @@
 #![forbid(unsafe_code)] // core algorithm: memory-safety is compiler-guaranteed here
 
 use crate::afpacket::{build_arp_request, build_ns, Injector};
-use crate::backend::{Backend, CopyEvent, InitCfg};
+use crate::backend::{Backend, CopyEvent, InitCfg, COPY_QUEUE_DEPTH};
 use crate::cli::{Cli, Engine, Mode};
 use crate::netlink::{AddrInfo, Net};
 use crate::packet::{build_frame, classify_learn, fix_icmpv6_csum, ETHERTYPE_IPV6};
@@ -15,7 +15,7 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::Duration;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{channel, Sender};
 
 /// Derived kernel-side state (ARCHITECTURE.md §syncer recompute()).
 #[derive(Clone, Debug, Default)]
@@ -55,7 +55,7 @@ pub struct Core {
     snap: Snap,
     initialized: bool,
     injector: Option<Injector>,
-    copy_tx: UnboundedSender<CopyEvent>,
+    copy_tx: Sender<CopyEvent>,
     host_routes: HashSet<IpAddr>, // fwd: ips with a /32-/128 host route programmed
     mirrored_br: Option<u32>,     // fwd: bridge index we last mirrored up0's IPs onto
     saved_br_cfg: Option<SavedBrCfg>, // fwd: bridge IPv6 knobs to restore on detach
@@ -68,7 +68,9 @@ pub struct Core {
 pub async fn run(cli: Cli) -> Result<()> {
     let net = Net::connect()?;
     let mut nl_rx = Net::monitor()?;
-    let (copy_tx, mut copy_rx) = unbounded_channel();
+    // Bounded + lossy (see COPY_QUEUE_DEPTH): a learn flood degrades to dropped copies
+    // (the next packet re-learns) instead of unbounded queue growth.
+    let (copy_tx, mut copy_rx) = channel(COPY_QUEUE_DEPTH);
 
     let backend: Box<dyn Backend> = match cli.engine {
         Engine::Nft => Box::new(crate::backend::nft::NftBackend::new()),
@@ -107,25 +109,55 @@ pub async fn run(cli: Cli) -> Result<()> {
     // keeps silent-but-present proxied guests alive); otherwise it flushes once per timeout.
     let aging_secs = if core.offload_active() { (timeout / 2).max(1) } else { timeout.max(1) };
     let mut aging = tokio::time::interval(Duration::from_secs(aging_secs));
+    // If the loop stalls past a period (e.g. a slow nft rebuild), don't fire make-up
+    // ticks back-to-back: bursty flushes would halve the effective idle timeout.
+    aging.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     aging.tick().await; // consume the immediate first tick
 
+    // Both signal streams are created once, outside the loop: a stream buffers signals
+    // that arrive while another select branch is being handled. (Calling ctrl_c() per
+    // iteration would recreate the listener each time and could miss a SIGINT.)
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     loop {
         tokio::select! {
             Some(ev) = copy_rx.recv() => {
                 if let Err(e) = core.on_copy(ev).await { log::warn!("copy: {e:#}"); }
             }
-            Some(_ch) = nl_rx.recv() => {
-                // coalesce a burst of netlink events into one recompute
-                while nl_rx.try_recv().is_ok() {}
-                if let Err(e) = core.on_netlink_change().await { log::warn!("netlink: {e:#}"); }
+            ch = nl_rx.recv() => {
+                match ch {
+                    Some(_) => {
+                        // coalesce a burst of netlink events into one recompute
+                        while nl_rx.try_recv().is_ok() {}
+                        if let Err(e) = core.on_netlink_change().await { log::warn!("netlink: {e:#}"); }
+                    }
+                    None => {
+                        // The multicast monitor died (e.g. socket overrun → ENOBUFS while
+                        // the loop was busy). Without it we'd silently stop tracking
+                        // HOSTMAC / addr / bridge changes, so rebuild it and resync; if
+                        // that fails, exit and let the supervisor restart us clean.
+                        log::error!("netlink monitor died; rebuilding");
+                        match Net::monitor() {
+                            Ok(rx) => {
+                                nl_rx = rx;
+                                if let Err(e) = core.on_netlink_change().await {
+                                    log::warn!("netlink resync: {e:#}");
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("netlink monitor rebuild failed: {e:#}; exiting");
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             _ = aging.tick() => {
                 if let Err(e) = core.on_tick().await { log::warn!("aging: {e:#}"); }
             }
             _ = sigterm.recv() => { log::info!("SIGTERM"); break; }
-            _ = tokio::signal::ctrl_c() => { log::info!("SIGINT"); break; }
+            _ = sigint.recv() => { log::info!("SIGINT"); break; }
         }
     }
 
@@ -195,8 +227,6 @@ impl Core {
         let enabled = self.offload_cfg().is_some();
         let magic = self.cli.offload_workaround_magic;
         let is_proxy = |a: &AddrInfo| enabled && a.rt_priority == magic;
-        let up0_global: Vec<AddrInfo> =
-            up0_addrs_all.iter().filter(|a| a.global && !is_proxy(a)).cloned().collect();
         // Mirror set = global + link-local. The host needs to be reachable at up0's
         // link-local on the bridge segment too (v6 ND), so fe80 is mirrored as well.
         // (No route is ever written for a mirrored address — routes are per learned
@@ -211,11 +241,20 @@ impl Core {
             None => vec![],
         };
 
-        // host_ips (accept / skip / src-selector) stays global-only.
+        // host_ips (accept / skip / src-selector) = global + link-local. The link-local
+        // addresses MUST be in here: they feed the kernel host4/host6 accept sets and the
+        // reconcile host-wins skip — without them a guest could claim the host's own fe80
+        // (learnable!) and have unicast-to-host-LL traffic (router NUD probes, unicast RA)
+        // demuxed away from the host. select_src is unaffected (an fe80/64 never contains
+        // a routable vm-ip, and LL guest entries never get a host route anyway).
         let host_ips = if self.is_fwd() {
-            up0_global.clone()
+            up0_mirror.clone()
         } else if br_present {
-            br_addrs.iter().filter(|a| a.global).cloned().collect()
+            br_addrs
+                .iter()
+                .filter(|a| a.global || is_link_local(&a.ip))
+                .cloned()
+                .collect()
         } else {
             vec![]
         };
@@ -447,6 +486,13 @@ impl Core {
         match ev {
             CopyEvent::Learn { ip, mac } => self.do_learn(ip, mac).await,
             CopyEvent::Nflog { hwaddr, dst_mac, ethertype, mut l3, reinject } => {
+                // Learn FIRST: with the entry already flashed into ip2mac, the reinjected
+                // ND hits the up0-egress discovery-dup rule as a *known* source and isn't
+                // echoed back into the vm bridge (the dedup there is an ip2mac lookup).
+                let learned = match classify_learn(ethertype, &l3) {
+                    Some((_kind, ip)) => self.do_learn(ip, hwaddr).await,
+                    None => Ok(()),
+                };
                 if reinject {
                     if ethertype == ETHERTYPE_IPV6 {
                         fix_icmpv6_csum(&mut l3);
@@ -456,11 +502,7 @@ impl Core {
                         let _ = inj.send_frame(&frame);
                     }
                 }
-                if let Some((_kind, ip)) = classify_learn(ethertype, &l3) {
-                    self.do_learn(ip, hwaddr).await
-                } else {
-                    Ok(())
-                }
+                learned
             }
         }
     }
@@ -611,7 +653,10 @@ impl Core {
 
     async fn on_tick(&mut self) -> Result<()> {
         if !self.initialized {
-            return Ok(());
+            // A failed init (e.g. transient nft error) is otherwise only retried on the
+            // next netlink event — which may never come if the topology is stable. Use
+            // the tick as a retry heartbeat; on_netlink_change inits if up0 is present.
+            return self.on_netlink_change().await;
         }
         self.aging_tick = self.aging_tick.wrapping_add(1);
         // Offload keepalive: the timer runs at timeout/2 and alternates probe/flush. On a
@@ -641,7 +686,7 @@ impl Core {
         let Some(inj) = &self.fwd0_injector else { return };
         let Some(hostmac) = self.snap.hostmac else { return };
         let host_v4 = self.snap.host_ips.iter().find_map(|a| match a.ip {
-            IpAddr::V4(v) => Some(v),
+            IpAddr::V4(v) if !is_link_local(&a.ip) => Some(v),
             _ => None,
         });
         let host_v6 = self.snap.host_ips.iter().find_map(|a| match a.ip {
@@ -706,8 +751,8 @@ impl Core {
     }
 
     /// Add the `iif lo lookup <vmroute-table>` rules (v4+v6) iff both a table and a rule
-    /// priority are configured (defaults: table=local, rule=-1 → no rule, since `local` is
-    /// consulted automatically). Idempotent.
+    /// priority are configured (defaults: table 200, prio 11000; either set to -1 skips —
+    /// e.g. no rule is needed if the table is one that's already consulted). Idempotent.
     async fn ensure_vmroute_rules(&self) -> Result<()> {
         if let (Some(table), Some(prio)) = (self.cli.vmroute_table.0, self.cli.vmroute_rule.0) {
             self.net.rule_add(false, table, prio).await?;

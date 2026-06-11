@@ -19,7 +19,29 @@ use crate::cli::Mode;
 use crate::types::Mac;
 use anyhow::Result;
 use std::net::IpAddr;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
+
+/// Copy-queue depth (reader threads → core). Bounded on purpose: the kernel copy
+/// path is already lossy (ringbuf overruns / NFLOG drops under pressure), so a full
+/// queue is handled the same way — drop the event, the next packet re-learns. An
+/// unbounded queue would let a guest cycling src addresses balloon memory, since
+/// each *new* address costs the core several netlink round-trips to reconcile.
+pub const COPY_QUEUE_DEPTH: usize = 1024;
+
+/// Lossy enqueue for the copy readers (see COPY_QUEUE_DEPTH). `dropped` is a
+/// per-reader counter; drops are logged at power-of-two counts to stay quiet.
+pub(crate) fn push_copy(tx: &Sender<CopyEvent>, ev: CopyEvent, dropped: &mut u64) {
+    use tokio::sync::mpsc::error::TrySendError;
+    match tx.try_send(ev) {
+        Ok(()) | Err(TrySendError::Closed(_)) => {} // closed = core shutting down
+        Err(TrySendError::Full(_)) => {
+            *dropped += 1;
+            if dropped.is_power_of_two() {
+                log::warn!("copy queue full: {dropped} learn events dropped so far (lossy by design)");
+            }
+        }
+    }
+}
 
 /// A learn event surfaced from the kernel copy path.
 #[derive(Debug)]
@@ -59,8 +81,8 @@ pub trait Backend: Send {
     fn name(&self) -> &'static str;
 
     /// Install chains/progs + maps/sets, program HOSTMAC/BRMAC/host_ips, and spawn
-    /// the copy reader (pushing to `copy_tx`).
-    fn init(&mut self, cfg: &InitCfg, copy_tx: UnboundedSender<CopyEvent>) -> Result<()>;
+    /// the copy reader (pushing to `copy_tx` via the lossy `push_copy`).
+    fn init(&mut self, cfg: &InitCfg, copy_tx: Sender<CopyEvent>) -> Result<()>;
 
     /// Remove all kernel state for this session (back to uninitialized).
     fn teardown(&mut self) -> Result<()>;

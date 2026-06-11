@@ -24,7 +24,7 @@ impl Injector {
             libc::socket(
                 libc::AF_PACKET,
                 libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                (ETH_P_ALL as u16).to_be() as i32,
+                ETH_P_ALL.to_be() as i32,
             )
         };
         if raw < 0 {
@@ -45,7 +45,7 @@ impl Injector {
         }
         let sa = libc::sockaddr_ll {
             sll_family: libc::AF_PACKET as u16,
-            sll_protocol: (ETH_P_ALL as u16).to_be(),
+            sll_protocol: ETH_P_ALL.to_be(),
             sll_ifindex: self.ifindex as i32,
             sll_hatype: 0,
             sll_pkttype: 0,

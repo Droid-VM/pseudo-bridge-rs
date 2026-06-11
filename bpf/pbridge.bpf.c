@@ -23,7 +23,7 @@ struct cfg {
     __u8 hostmac[6];
     __u8 brmac[6];
     __u8 has_brmac;
-    __u8 _pad;
+    __u8 _pad[3]; /* explicit: keep layout byte-identical with the Rust Cfg */
     __u32 up0_ifx;
     __u32 fwd0_ifx;
 };

@@ -1,7 +1,7 @@
 //! ebpf backend: loads the BPF datapath (build.rs object) with aya, attaches tc
 //! programs, manages maps, and reads learn tuples from a ringbuf. Zero nft.
 
-use super::{Backend, CopyEvent, InitCfg};
+use super::{push_copy, Backend, CopyEvent, InitCfg};
 use crate::cli::Mode;
 use crate::types::Mac;
 use anyhow::{anyhow, Context, Result};
@@ -12,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 // include_bytes! yields alignment-1 data, but ELF parsing needs 8-byte alignment.
 #[repr(align(8))]
@@ -96,7 +96,7 @@ impl Backend for EbpfBackend {
         "ebpf"
     }
 
-    fn init(&mut self, cfg: &InitCfg, copy_tx: UnboundedSender<CopyEvent>) -> Result<()> {
+    fn init(&mut self, cfg: &InitCfg, copy_tx: Sender<CopyEvent>) -> Result<()> {
         let mut ebpf = EbpfLoader::new().load(bpf_obj()).context("load bpf object")?;
 
         self.cur = Cfg {
@@ -302,11 +302,12 @@ impl Backend for EbpfBackend {
     }
 }
 
-fn spawn_ringbuf_reader(mut ring: RingBuf<MapData>, stop: Arc<AtomicBool>, tx: UnboundedSender<CopyEvent>) {
+fn spawn_ringbuf_reader(mut ring: RingBuf<MapData>, stop: Arc<AtomicBool>, tx: Sender<CopyEvent>) {
     std::thread::Builder::new()
         .name("ringbuf-reader".into())
         .spawn(move || {
             let fd = ring.as_raw_fd();
+            let mut dropped = 0u64;
             loop {
                 if stop.load(Ordering::SeqCst) {
                     break;
@@ -332,7 +333,7 @@ fn spawn_ringbuf_reader(mut ring: RingBuf<MapData>, stop: Arc<AtomicBool>, tx: U
                         b.copy_from_slice(&d[8..24]);
                         IpAddr::V6(Ipv6Addr::from(b))
                     };
-                    let _ = tx.send(CopyEvent::Learn { ip, mac });
+                    push_copy(&tx, CopyEvent::Learn { ip, mac }, &mut dropped);
                 }
             }
         })
@@ -343,9 +344,16 @@ fn spawn_ringbuf_reader(mut ring: RingBuf<MapData>, stop: Arc<AtomicBool>, tx: U
 mod parse_test {
     #[test]
     fn bpf_obj_parses() {
-        match aya::Ebpf::load(super::bpf_obj()) {
-            Ok(_) => println!("PARSE OK"),
-            Err(e) => println!("PARSE ERR: {e:?}"),
+        // Full load creates maps (needs bpf() permission), so accept a syscall-level
+        // failure — but any ELF/object-format problem (bad alignment, bad sections)
+        // must fail the test: those would break every deployment.
+        if let Err(e) = aya::Ebpf::load(super::bpf_obj()) {
+            let msg = format!("{e:?}");
+            assert!(
+                !msg.contains("Parse") && !msg.contains("alignment"),
+                "BPF object failed to parse: {msg}"
+            );
+            eprintln!("bpf load failed post-parse (no bpf perms?): {msg}");
         }
     }
 }
