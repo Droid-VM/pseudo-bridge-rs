@@ -41,10 +41,19 @@ one(){ # $1 = engine
   grep -q 'backend running' /tmp/pb-silent-$engine.log || { echo "  [$engine] pbridge NOT RUNNING"; rc=1; return; }
   for _ in $(seq 1 20); do ip -n hostns link show mt-br >/dev/null 2>&1 && break; sleep 0.2; done
   ip -n hostns link set mt-br master br0; sleep 1
-  # The VM has sent nothing; only the host probes it. ping retries give the discovery dup
-  # time to learn the VM and create the vmroute (resolved on the bridge on retry).
-  if ip netns exec hostns ping -c4 -W2 10.0.0.5 >/dev/null 2>&1; then echo "  [$engine] host -> silent VM v4 OK"; else echo "  [$engine] host -> silent VM v4 FAIL"; rc=1; fi
-  if ip netns exec hostns ping -c4 -W2 fd00::5 >/dev/null 2>&1; then echo "  [$engine] host -> silent VM v6 OK"; else echo "  [$engine] host -> silent VM v6 FAIL"; rc=1; fi
+  # The VM has sent nothing; only the host probes it. The discovery dup learns the VM
+  # from its reply and creates the vmroute, so connectivity comes up "on retry" — the
+  # assertion is *eventual* success within a budget (a fixed ping count is load-
+  # sensitive: learn + route reconcile can straddle the window on a busy box).
+  try_ping(){ # $1 dst -> 0 if a ping succeeds within 20s
+    local end=$((SECONDS+20))
+    while [ $SECONDS -lt $end ]; do
+      ip netns exec hostns ping -c1 -W2 "$1" >/dev/null 2>&1 && return 0
+    done
+    return 1
+  }
+  if try_ping 10.0.0.5; then echo "  [$engine] host -> silent VM v4 OK"; else echo "  [$engine] host -> silent VM v4 FAIL"; rc=1; fi
+  if try_ping fd00::5; then echo "  [$engine] host -> silent VM v6 OK"; else echo "  [$engine] host -> silent VM v6 FAIL"; rc=1; fi
 }
 
 for e in ${ENGINES:-nft ebpf}; do one "$e"; done

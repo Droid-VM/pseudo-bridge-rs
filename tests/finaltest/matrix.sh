@@ -165,15 +165,18 @@ run_config(){ # $1 mode $2 engine ; echoes "pass total"
 }
 
 trap topo_down EXIT
-ENGINES=$(engines_for_env)
+# MODES / ENGINES are overridable from the environment so a runner (run_all_test.py)
+# can split the matrix into per-config units and run them in parallel.
+ENGINES="${ENGINES:-$(engines_for_env)}"
+MODES="${MODES:-direct fwd fwd-with-offload}"
 echo "###### pbridge matrix ENV=$ENV  configs = mode(direct,fwd) x engine($ENGINES) ######"
-for mode in direct fwd fwd-with-offload; do for engine in $ENGINES; do
+for mode in $MODES; do for engine in $ENGINES; do
   printf "== config mode=%-6s engine=%-5s ==\n" "$mode" "$engine"
   RESULT["$mode/$engine"]="$(run_config "$mode" "$engine")"
 done; done
 echo; echo "================ SUMMARY (ENV=$ENV) ================"
 allgood=1
-for mode in direct fwd fwd-with-offload; do for engine in $ENGINES; do
+for mode in $MODES; do for engine in $ENGINES; do
   r="${RESULT[$mode/$engine]}"
   case "$r" in
     FAILSTART) printf "  %-6s %-5s : FAIL (did not start)\n" "$mode" "$engine"; allgood=0;;

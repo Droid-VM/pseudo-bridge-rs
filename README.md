@@ -108,6 +108,9 @@ re-initializes when it comes back.
 ## Tests
 
 ```sh
+sudo tests/run_all_test.py                      # EVERYTHING in parallel (~1.5 min): matrix split
+                                                #   per config + func scripts per engine + cargo test,
+                                                #   each in its own mount+net namespace; summary at the end
 bash tests/finaltest/matrix.sh                  # linux: mode(direct,fwd,fwd-with-offload) × engine(nft,ebpf), 16 cases each
 bash tests/finaltest/smoke.sh fwd ebpf          # 1-guest quick check
 bash tests/finaltest/func-arp-keepalive.sh      # firmware single-v4-slot simulation (case 18)
