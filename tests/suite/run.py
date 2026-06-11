@@ -43,6 +43,11 @@ WRAP = (
     'ip link set lo up && exec "$@"'
 )
 
+# unshare invocation. Overridable so the GKI guest (busybox unshare, no --kill-child)
+# can use the basic flags; the host default uses util-linux for tighter child cleanup.
+UNSHARE = os.environ.get(
+    "SUITE_UNSHARE", "unshare --mount --net --fork --kill-child").split()
+
 RUNNING = {}
 RUNNING_LOCK = threading.Lock()
 RESULT_RX = re.compile(r"^(ok|fail|skip) (\S+)")
@@ -60,11 +65,10 @@ def build_units(with_gki: bool):
 
 
 def run_unit(name, env, sim, mode, engine, timeout, log_dir, retry):
-    if env == "gki":
-        return name, False, "gki executor not wired up yet (next step)", 0.0, {}
+    # gki units don't come through here — they run in one QEMU boot via the batch
+    # executor (gki_run.run_gki), launched separately in main().
     argv = [
-        "unshare", "--mount", "--net", "--fork", "--kill-child",
-        "bash", "-c", WRAP, "wrap",
+        *UNSHARE, "bash", "-c", WRAP, "wrap",
         sys.executable, str(HERE / "suite.py"),
         "--env", env, "--sim", sim, "--mode", mode, "--engine", engine,
     ]
@@ -101,6 +105,44 @@ def run_unit(name, env, sim, mode, engine, timeout, log_dir, retry):
     return name, rc == 0, "", time.monotonic() - t0, cases
 
 
+def gki_guest(jobs: int) -> int:
+    """Run inside the GKI guest: every gki unit in parallel, each in its own
+    unshare --mount --net (GKI has netns + mount ns), bracketed by @@UNIT markers on
+    the console for the host (gki_run._parse) to demux. Same run_unit/unshare path as
+    the host side — the guest is just another executor."""
+    units = [(f"gki/ebpf/{sim}/{mode}", "gki", sim, mode, "ebpf")
+             for sim, modes in SIM_MODES.items() for mode in modes]
+    log_dir = Path("/tmp/gki-guest-logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    print("@@GKI_START", flush=True)
+    rc = 0
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        futs = {pool.submit(run_unit, n, e, s, m, g, 900, log_dir, 0): n
+                for n, e, s, m, g in units}
+        for fut in as_completed(futs):
+            name, ok, _note, _dur, cases = fut.result()
+            print(f"@@UNIT {name}", flush=True)
+            for cn, st in cases.items():
+                print(f"{st} {cn}", flush=True)
+                if st == "fail":
+                    rc = 1
+            if not cases:
+                print("fail unit-start", flush=True)
+                rc = 1
+            if not ok:  # dump the unit log to the console for post-mortem
+                logf = log_dir / f"{name.replace('/', '_')}.log"
+                print("@@LOG-BEGIN", flush=True)
+                try:
+                    for ln in logf.read_text().splitlines()[-40:]:
+                        print(f"| {ln}", flush=True)
+                except OSError:
+                    print("| (no log)", flush=True)
+                print("@@LOG-END", flush=True)
+            print("@@UNITEND", flush=True)
+    print("@@GKI_COMPLETE", flush=True)
+    return rc
+
+
 def prebuild():
     print("prebuild: cargo build (pbridge) ...", flush=True)
     subprocess.run(["cargo", "build"], cwd=ROOT, check=True)
@@ -122,8 +164,13 @@ def main():
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--retry", type=int, default=1)
     ap.add_argument("--gki", action="store_true", help="include gki (QEMU) units")
+    ap.add_argument("--gki-guest", action="store_true",
+                    help="(inside the GKI guest) run gki units in parallel with console markers")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
+
+    if args.gki_guest:
+        return gki_guest(args.jobs)
 
     units = [u for u in build_units(args.gki) if args.only in u[0]]
     if args.list:
@@ -137,16 +184,29 @@ def main():
         print("must run as root (unshare + netns + tc + bpf)")
         return 2
 
+    host_units = [u for u in units if u[1] != "gki"]
+    gki_units = [u for u in units if u[1] == "gki"]
+
     prebuild()
     log_dir = Path(f"/tmp/pbridge-suite-{time.strftime('%Y%m%d-%H%M%S')}")
     log_dir.mkdir(parents=True)
-    print(f"running {len(units)} units, -j {args.jobs}, logs: {log_dir}", flush=True)
+    print(f"running {len(host_units)} host units (-j {args.jobs})"
+          f"{f' + {len(gki_units)} gki units (1 QEMU boot)' if gki_units else ''}; "
+          f"logs: {log_dir}", flush=True)
 
     t0 = time.monotonic()
     results = {}
+
+    # The whole gki matrix runs in a single QEMU boot, in parallel with the host pool.
+    gki_pool = gki_future = None
+    if gki_units:
+        import gki_run
+        gki_pool = ThreadPoolExecutor(max_workers=1)
+        gki_future = gki_pool.submit(gki_run.run_gki, max(args.timeout * 3, 2400))
+
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futs = {pool.submit(run_unit, n, e, s, m, g, args.timeout, log_dir, args.retry): n
-                for n, e, s, m, g in units}
+                for n, e, s, m, g in host_units}
         done = 0
         try:
             for fut in as_completed(futs):
@@ -156,7 +216,7 @@ def main():
                 nf = sum(1 for v in cases.values() if v == "fail")
                 no = sum(1 for v in cases.values() if v == "ok")
                 ns = sum(1 for v in cases.values() if v == "skip")
-                print(f"[{done:2}/{len(units)}] {'PASS' if ok else 'FAIL'}  {name:36} "
+                print(f"[{done:2}/{len(host_units)}] {'PASS' if ok else 'FAIL'}  {name:36} "
                       f"{dur:6.1f}s  ({no} ok, {nf} fail, {ns} skip)", flush=True)
         except KeyboardInterrupt:
             print("\ninterrupted — killing running units")
@@ -169,6 +229,25 @@ def main():
                     except ProcessLookupError:
                         pass
             raise
+
+    if gki_future is not None:
+        print("gki: waiting for QEMU boot + matrix (TCG, slow) ...", flush=True)
+        try:
+            gki_res, complete, gki_log = gki_future.result()
+        except Exception as e:
+            print(f"gki: executor crashed: {e}", flush=True)
+            gki_res, complete, gki_log = {}, False, "?"
+        gki_pool.shutdown()
+        note = "" if complete else "guest did not complete"
+        for name, *_ in gki_units:
+            ok, cases = gki_res.get(name, (False, {}))
+            results[name] = (ok, 0.0, cases, note if not cases else "")
+            nf = sum(1 for v in cases.values() if v == "fail")
+            no = sum(1 for v in cases.values() if v == "ok")
+            ns = sum(1 for v in cases.values() if v == "skip")
+            print(f"[gki] {'PASS' if ok else 'FAIL'}  {name:36}   ({no} ok, {nf} fail, {ns} skip)",
+                  flush=True)
+        print(f"gki console log: {gki_log}", flush=True)
 
     wall = time.monotonic() - t0
     failed_units = [n for n, (ok, *_r) in results.items() if not ok]

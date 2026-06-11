@@ -4,14 +4,18 @@ Fixed names are safe because run.py executes every unit inside its own mount+net
 namespace (private /run/netns + /tmp), so parallel units can never collide.
 """
 
+import os
 import subprocess
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-BIN = ROOT / "target/debug/pbridge"
-UPSIM = ROOT / "tools/upsim/target/x86_64-unknown-linux-musl/release/upsim"
-NOEBPF = ROOT / "tests/finaltest/noebpf"
+# Binaries default to the host build tree, but each is overridable so the GKI
+# executor can point at the aarch64 binaries staged inside the guest rootfs.
+BIN = Path(os.environ.get("PBRIDGE_BIN", ROOT / "target/debug/pbridge"))
+UPSIM = Path(os.environ.get("UPSIM_BIN",
+                            ROOT / "tools/upsim/target/x86_64-unknown-linux-musl/release/upsim"))
+NOEBPF = Path(os.environ.get("NOEBPF_BIN", ROOT / "tests/finaltest/noebpf"))
 
 HMAC = "02:00:00:00:00:01"
 GW4, GW6 = "10.0.0.1", "fd00::1"

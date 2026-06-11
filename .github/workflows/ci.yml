@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fast gate: builds, lints, unit tests. No privileges needed.
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang (BPF object in build.rs)
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-targets --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  # Full functional suite on the host: env(local ebpf, lxc nft) × sim × mode, in
+  # parallel namespaces. Needs root + netns + nft + ebpf(TCX, kernel >= 6.6 — current
+  # ubuntu runners qualify). The GKI/QEMU env is a separate, heavier workflow.
+  suite:
+    runs-on: ubuntu-latest
+    needs: lint-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install suite dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang nftables iproute2 tcpdump dnsmasq busybox-static \
+                                  libseccomp-dev util-linux
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Add musl target (upsim + x64 static)
+        run: rustup target add x86_64-unknown-linux-musl
+      - name: Kernel + capability info (for triage)
+        run: uname -r; ip -V; nft --version || true
+      - name: Run the suite (host envs)
+        run: sudo -E env "PATH=$PATH" python3 tests/suite/run.py -j 4 --retry 2

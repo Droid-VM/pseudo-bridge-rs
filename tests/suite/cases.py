@@ -144,10 +144,11 @@ def silent_vm(c: Ctx):
     sh("ip", "-n", "vm3", "addr", "add", f"{VM3_6}/64", "dev", "eth0", "nodad")
     sh("ip", "-n", "vm3", "link", "set", "eth0", "up")
     # vm3 never initiates; connectivity comes up "on retry" via the discovery dup. v6
-    # is slower (ND + solicited-node), and under parallel CPU saturation the discovery
-    # round-trip stretches — generous budgets keep it an eventual-success assertion.
-    expect_ping("phone", VM3_4, "phone -> silent vm3 v4", budget=30)
-    expect_ping("phone", VM3_6, "phone -> silent vm3 v6", budget=30)
+    # is slower (ND + solicited-node), and the round-trip stretches a lot under load —
+    # especially the GKI guest (QEMU TCG, ~20x slower) running units in parallel. These
+    # are eventual-success assertions, so the budgets are deliberately generous.
+    expect_ping("phone", VM3_4, "phone -> silent vm3 v4", budget=45)
+    expect_ping("phone", VM3_6, "phone -> silent vm3 v6", budget=75)
 
 
 @case(requires=lambda c: shutil.which("dnsmasq") and shutil.which("busybox"),

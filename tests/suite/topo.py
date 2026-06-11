@@ -13,6 +13,7 @@ upsim modes: portsec (inbound untouched) | apf (ARP/NS offload over all up0 addr
 
 import subprocess
 import time
+from pathlib import Path
 
 from common import (
     GW4, GW6, HMAC, HOST4, HOST6, LEAK_LOG, NEIGH1_4, NEIGH1_6, NEIGH2_4, NEIGH2_6,
@@ -81,7 +82,11 @@ class Topo:
                            "--mode", self.sim, "--leak-log", str(LEAK_LOG),
                            ns="phone", log="/tmp/upsim.log")
         if not until_ok(5, lambda: sh_ok("ip", "-n", "phone", "link", "show", "up0")):
-            raise RuntimeError("upsim taps did not appear (see /tmp/upsim.log)")
+            try:
+                why = Path("/tmp/upsim.log").read_text()[-300:]
+            except OSError:
+                why = "(no upsim.log)"
+            raise RuntimeError(f"upsim taps did not appear; upsim.log:\n{why}")
         # up0 is the phone's real interface: it DOES speak v6. Order matters — upsim
         # already brought the tap up (v6-less thanks to the ns default), so set the
         # mac FIRST, then re-enable v6: enabling v6 on an up interface fires DAD/MLD

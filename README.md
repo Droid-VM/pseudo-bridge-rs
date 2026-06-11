@@ -45,7 +45,6 @@ Full design — every rule table, state machine, and tradeoff: **[ARCHITECTURE.m
 |------|------|-------|
 | `direct` | up0 is a normal port that *can* join a bridge (wired, but the switch pins src-mac) | up0 egress (OUT) + up0 ingress (IN); kernel bridge forwards |
 | `fwd` | up0 **can't** be bridged (Wi-Fi STA / `IFF_DONT_BRIDGE`) | pbridge creates veth `fwd0╌fwd1`, hooks fwd0 ingress (OUT) + up0 ingress (IN), forwards itself; `fwd1` goes into your VM bridge |
-| `fwd-with-offload` | `fwd` on Android Wi-Fi | = `fwd` + `--offload-workaround v4,v6` on by default (see below) |
 
 **pbridge pins only `up0`.** The bridge is discovered dynamically (`up0.master` /
 `fwd1.master`): attach, swap, or detach it at any time and pbridge follows — HOSTMAC,
@@ -60,10 +59,10 @@ more — manual rebinds are never fought).
 ./build.sh host            # quick debug build (./target/debug/pbridge)
 
 # Android Wi-Fi STA (root, e.g. KernelSU), VM bridge vmbr already exists:
-pbridge -i wlan0 -e ebpf -m fwd-with-offload -b vmbr --arp-keepalive 10
+pbridge -i wlan0 -e ebpf -m fwd -b vmbr --offload-workaround v4,v6 --arp-keepalive 10
 
 # linux container with nftables but no bpf permission:
-pbridge -i eth0 -e nft -m direct -b br0
+pbridge -i eth0 -e nft -m direct -b vmbr
 ```
 
 Run as root (needs `CAP_NET_ADMIN` + raw sockets; ebpf additionally `bpf()`).

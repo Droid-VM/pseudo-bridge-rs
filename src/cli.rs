@@ -130,8 +130,13 @@ impl std::str::FromStr for MaxCap {
 }
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "pbridge", version, about = "pseudo-bridge MAC-NAT offload")]
+#[command(name = "pbridge", version, disable_version_flag = true,
+          about = "pseudo-bridge MAC-NAT offload")]
 pub struct Cli {
+    /// Print version and exit.
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    pub version: Option<bool>,
+
     /// Upstream interface (up0).
     #[arg(short = 'i', long = "interface")]
     pub interface: String,
@@ -266,6 +271,7 @@ mod tests {
     #[test]
     fn fwd_defaults() {
         let cli = Cli {
+            version: None,
             interface: "wlan0verylongname".into(),
             engine: Engine::Ebpf,
             mode: Mode::Fwd,

@@ -28,7 +28,17 @@ def run_unit(env: str, sim: str, mode: str, engine: str, only: str = "") -> list
     try:
         topo.up()
         if not pb.start():
-            return [("unit-start", "fail", "pbridge did not start (see /tmp/pbridge.log)", 0.0)]
+            import pb as pbmod
+            try:
+                tail = Path(pbmod.PB_LOG).read_text()[-600:]
+            except OSError:
+                tail = "(no pbridge log)"
+            try:
+                up = Path("/tmp/upsim.log").read_text()[-200:]
+            except OSError:
+                up = ""
+            return [("unit-start", "fail",
+                     f"pbridge did not start:\n{tail}\n--upsim--\n{up}", 0.0)]
         for c in CASES:
             if only and only not in c.name:
                 continue
