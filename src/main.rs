@@ -24,7 +24,7 @@ fn main() -> Result<()> {
 
     log::info!(
         "pbridge start: if={} engine={:?} mode={:?} fwd0={} fwd1={} nflog-group={} timeout={}s \
-         offload-workaround={:?} loglevel={}",
+         offload-workaround={:?} arp-keepalive={}s loglevel={}",
         cli.interface,
         cli.engine,
         cli.mode,
@@ -33,6 +33,7 @@ fn main() -> Result<()> {
         cli.nflog_group,
         cli.timeout,
         cli.offload_workaround,
+        cli.arp_keepalive,
         cli.loglevel,
     );
 

@@ -185,6 +185,16 @@ pub struct Cli {
     #[arg(long = "offload-workaround-magic", value_parser = parse_magic, default_value_t = 4243672773)]
     pub offload_workaround_magic: u32,
 
+    /// Periodic ARP keepalive interval in seconds (0 = off). Every interval, for each
+    /// learned guest IPv4, send a unicast ARP reply (spa=guest, sha=HOSTMAC) to every v4
+    /// neighbour on up0, plus a periodic gratuitous ARP broadcast. Keeps upstream
+    /// neighbour caches REACHABLE from our (outbound) side, so peers never need to
+    /// ARP-request the guest — works around Wi-Fi firmware ARP offload that only answers
+    /// for a single IPv4 (e.g. Qualcomm WMI_SET_ARP_NS_OFFLOAD) and drops other ARP
+    /// requests in powersave. Recommended on Android Wi-Fi: 10.
+    #[arg(long = "arp-keepalive", default_value_t = 0)]
+    pub arp_keepalive: u64,
+
     /// Routing table for the per-guest vmroutes (host → guest; external traffic never hits
     /// routing — it's redirected by the datapath into the bridge and switched). Used with the
     /// `iif lo` rule below so only locally-originated traffic consults it; use a *dedicated*
@@ -256,6 +266,7 @@ mod tests {
             max_cap: MaxCap::default(),
             offload_workaround: None,
             offload_workaround_magic: 4243672773,
+            arp_keepalive: 0,
             vmroute_table: RouteTarget(Some(200)),
             vmroute_rule: RouteTarget(Some(11000)),
         };

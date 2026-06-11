@@ -4,7 +4,7 @@
 //! netlink link/addr changes (recompute+diff), and the aging timer.
 #![forbid(unsafe_code)] // core algorithm: memory-safety is compiler-guaranteed here
 
-use crate::afpacket::{build_arp_request, build_ns, Injector};
+use crate::afpacket::{build_arp_reply, build_arp_request, build_ns, Injector};
 use crate::backend::{Backend, CopyEvent, InitCfg, COPY_QUEUE_DEPTH};
 use crate::cli::{Cli, Engine, Mode};
 use crate::netlink::{AddrInfo, Net};
@@ -13,7 +13,7 @@ use crate::state::Entries;
 use crate::types::{family, is_learnable_unicast, is_link_local, Family, Mac};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 use tokio::sync::mpsc::{channel, Sender};
 
@@ -63,7 +63,12 @@ pub struct Core {
     installed: HashMap<IpAddr, Mac>, // vmroutes currently programmed (for transition logging)
     fwd0_injector: Option<Injector>, // fwd: AF_PACKET on fwd0, for the offload keepalive probe
     aging_tick: u64,                 // counts aging ticks (probe/flush alternation in offload)
+    keepalive_tick: u64,             // counts --arp-keepalive ticks (GARP every Nth)
 }
+
+/// --arp-keepalive sends the GARP broadcast only every Nth tick (unicast replies go
+/// every tick): broadcasts wake every powersaving client on the WLAN, so be polite.
+const GARP_EVERY: u64 = 3;
 
 pub async fn run(cli: Cli) -> Result<()> {
     let net = Net::connect()?;
@@ -95,6 +100,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         installed: HashMap::new(),
         fwd0_injector: None,
         aging_tick: 0,
+        keepalive_tick: 0,
     };
     if core.cli.offload_workaround.is_some() && !core.is_fwd() {
         log::warn!("--offload-workaround is set but mode is direct; ignoring (fwd-mode only)");
@@ -113,6 +119,12 @@ pub async fn run(cli: Cli) -> Result<()> {
     // ticks back-to-back: bursty flushes would halve the effective idle timeout.
     aging.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     aging.tick().await; // consume the immediate first tick
+
+    // --arp-keepalive timer (inert unless enabled; the select arm is gated below).
+    let ka_enabled = core.cli.arp_keepalive > 0;
+    let mut keepalive = tokio::time::interval(Duration::from_secs(core.cli.arp_keepalive.max(1)));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await; // consume the immediate first tick
 
     // Both signal streams are created once, outside the loop: a stream buffers signals
     // that arrive while another select branch is being handled. (Calling ctrl_c() per
@@ -155,6 +167,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             _ = aging.tick() => {
                 if let Err(e) = core.on_tick().await { log::warn!("aging: {e:#}"); }
+            }
+            _ = keepalive.tick(), if ka_enabled => {
+                if let Err(e) = core.on_arp_keepalive().await { log::warn!("arp-keepalive: {e:#}"); }
             }
             _ = sigterm.recv() => { log::info!("SIGTERM"); break; }
             _ = sigint.recv() => { log::info!("SIGINT"); break; }
@@ -675,6 +690,79 @@ impl Core {
             self.entries.remove(&ip);
             self.reconcile(ip).await?; // entry gone → withdraw
         }
+        Ok(())
+    }
+
+    /// --arp-keepalive tick: refresh upstream v4 neighbour caches from OUR side so peers
+    /// never need to ARP-request a guest address. Wi-Fi firmware ARP offload (e.g.
+    /// Qualcomm WMI_SET_ARP_NS_OFFLOAD) holds a single IPv4 slot — in powersave it
+    /// answers only for the host's primary v4 and drops ARP requests for everything
+    /// else, so inbound resolution of guest IPs is ~dead while the chip sleeps. Outbound
+    /// frames are unaffected, so we push instead of waiting to be asked:
+    ///   - unicast ARP reply (spa=guest, sha=HOSTMAC) to every v4 neighbour on up0 —
+    ///     Linux sets a unicast reply to NUD_REACHABLE (broadcast replies/requests
+    ///     don't assert reachability), so the entry never decays into probing;
+    ///   - GARP broadcast every GARP_EVERY ticks — best-effort STALE refresh for LAN
+    ///     peers that aren't in up0's neighbour table (they only talk to the VM);
+    ///   - a gateway absent from the neighbour table (GC'd on an idle host) is
+    ///     re-solicited from a host address; the next tick covers it.
+    async fn on_arp_keepalive(&mut self) -> Result<()> {
+        if !self.initialized {
+            return Ok(());
+        }
+        let guests: Vec<Ipv4Addr> = self
+            .installed
+            .keys()
+            .filter_map(|ip| match ip {
+                IpAddr::V4(g) => Some(*g),
+                _ => None,
+            })
+            .collect();
+        if guests.is_empty() {
+            return Ok(());
+        }
+        self.keepalive_tick = self.keepalive_tick.wrapping_add(1);
+        let garp_tick = self.keepalive_tick.is_multiple_of(GARP_EVERY);
+
+        let mut neigh = self.net.neighbours_v4(self.snap.up0_index).await;
+        let host = self.snap.host_ip_set();
+        neigh.retain(|(ip, _)| {
+            !host.contains(&IpAddr::V4(*ip)) && !self.installed.contains_key(&IpAddr::V4(*ip))
+        });
+        let have: HashSet<Ipv4Addr> = neigh.iter().map(|(ip, _)| *ip).collect();
+        let missing_gws: Vec<Ipv4Addr> = self
+            .net
+            .default_gw4()
+            .await
+            .into_iter()
+            .filter(|gw| !have.contains(gw))
+            .collect();
+        let host_v4 = self.snap.host_ips.iter().find_map(|a| match a.ip {
+            IpAddr::V4(v) if !is_link_local(&a.ip) => Some(v),
+            _ => None,
+        });
+
+        let Some(inj) = &self.injector else { return Ok(()) };
+        let Some(hostmac) = self.snap.hostmac else { return Ok(()) };
+        for gw in missing_gws {
+            if let Some(src) = host_v4 {
+                let _ = inj.send_frame(&build_arp_request(gw, src, hostmac));
+            }
+        }
+        for g in &guests {
+            for (nip, nmac) in &neigh {
+                let _ = inj.send_frame(&build_arp_reply(*g, hostmac, *nip, *nmac));
+            }
+            if garp_tick {
+                let _ = inj.send_garp(*g, hostmac);
+            }
+        }
+        log::debug!(
+            "arp-keepalive: {} guest v4 x {} neighbours{}",
+            guests.len(),
+            neigh.len(),
+            if garp_tick { " + garp" } else { "" }
+        );
         Ok(())
     }
 

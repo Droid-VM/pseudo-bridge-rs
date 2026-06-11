@@ -25,6 +25,9 @@ multi-guest 共用一個「只認得單一 mac」的上游口(Wi-Fi STA、或被
         --max-cap           entry 上限 = v4_per_mac, v6_per_mac, v4_global, v6_global;預設 16,64,256,1024
         --offload-workaround       ND/ARP offload 繞道,逗號子集 v4,v6,v6ll(僅 fwd mode 生效;見 §ND/ARP offload 繞道)
         --offload-workaround-magic 上述繞道在 up0 上代理位址的 IFA_RT_PRIORITY 魔術標記;預設 4243672773(接受十進位或 0x 十六進位)
+        --arp-keepalive     週期性 v4 ARP keepalive 秒數;`0`=關(預設)。對 up0 每個 v4 鄰居替每個已學 guest v4 發單播 ARP reply
+                            (+ 週期 GARP),讓上游鄰居快取常駐 REACHABLE、永不需要對 guest 發 ARP request——繞過 Wi-Fi 韌體
+                            「v4 ARP offload 只有單一 slot、powersave 下丟其他 ARP request」的限制(見 §ARP keepalive)。Android Wi-Fi 建議 10
         --vmroute-table     per-guest vmroute 寫入的 table(配下面 iif lo rule;用**專用** table,別用 local/main);`-1`=不寫 vmroute、數字=該 table、名稱=查 rt_tables(查不到 error);預設 `200`
         --vmroute-rule      `iif lo lookup <vmroute-table>` 規則的 priority(只有本機發起的流量查這張表);`-1`=不下規則(指到本就被查的 table 如 local 時)、數字=該 prio;預設 `11000`
 
@@ -554,6 +557,44 @@ syncer 是**唯一寫/撤 kernel offload 狀態的人**。維護兩份 state、�
 
 **模式/位置**:**僅 fwd**(up0 獨立站,APF 掛在實體網卡、看 up0 自己的位址表)。direct mode 下 up0 是 bridge port(有線情境,Wi-Fi STA 無法 bridge),kernel 對 bridge port 設 `allmulti`、NS 經 bridge 自然到 guest,**不需此繞道**;且 guest 已在該 bridge 上、位址不能再裝到 up0.master(撞重)。故 direct mode 此旗標**惰性忽略**(啟動時 warn 一行)。teardown 時 `unproxy_all()` 全撤。
 
+### ARP keepalive(`--arp-keepalive`;v4 出向鄰居快取保活)
+
+**問題(實機診斷,高通 Wi-Fi)**:offload 繞道把 guest 位址裝上 up0 後,「醒著時」kernel/APF 答得了 ARP;但 powersave 下接手的是韌體原生 **WMI ARP offload**(`WMI_SET_ARP_NS_OFFLOAD_CMDID`,driver 路徑 `hdd_populate_ipv4_addr → ucfg_dp_set_ipv4_addr`),它的 **v4 只有一個 slot**(host primary;v6 NS offload 多 slot,故 v6 不受害)。睡眠中對「tpa ≠ 該 slot」的 ARP request(廣播 INCOMPLETE 解析與單播 NUD probe 都算)**直接丟**,只有零星醒著的窗口放行 → 實測 guest v4 的 ARP request 丟包 ~99%,gateway 對 guest 的 neigh entry 在 `INCOMPLETE→FAILED→STALE→DELAY→PROBE` 間擺盪,v4 時好時壞;`powersave off` 全好但整機耗電。
+
+**解法(順著 powersave,不對抗)**:把「inbound ARP 能不能進來」翻轉成「**outbound 定期送**」——STA 發送不受 powersave 影響。依據 Linux `arp_process()`:**單播 ARP reply(`PACKET_HOST`)即使 unsolicited 也把對方 entry 設成 `NUD_REACHABLE`**;廣播 reply(GARP)與 request 最多 STALE、且 `arp_accept=0` 時不建新 entry(kernel 原文註解 "Broadcast replies and request packets do not assert neighbour reachability")。⇒ 對 up0 鄰居表中每個 v4 鄰居、替每個已學 guest v4 週期發 unsolicited 單播 reply:對方 entry **常駐 REACHABLE、永不進 DELAY/PROBE、永不發 request** → 韌體丟不丟 inbound ARP 變得無關;另補週期 GARP 給「不在 host 鄰居表、但自己快取過 guest」的 LAN peer(刷成 STALE,best-effort)。已存在的 `INCOMPLETE`/`FAILED` entry(對方試圖送 guest 而解析失敗時自動建立)也會被單播 reply 直接解開(lladdr 填入 → REACHABLE → 排隊封包放行)。
+
+**模組落點**:
+
+    cli      : --arp-keepalive <secs>(0=off 預設;Android Wi-Fi 建議 10)
+    netlink  : default_gw4()(同 default_gw6 的 v4 版)+ neighbours_v4(ifindex)
+               (RTM_GETNEIGH dump:取有 lladdr 且 state ∈ REACHABLE/STALE/DELAY/PROBE/PERMANENT 者)
+    afpacket : build_arp_reply(spa=G, sha=HOSTMAC, tpa=n.ip, tha=n.mac, L2dst=n.mac)(單播);GARP 用既有 build_garp
+    core     : 獨立 interval timer(MissedTickBehavior::Delay),經 up0 Injector(AF_PACKET)注入
+
+```
+# 每 --arp-keepalive 秒(0=off;未 initialized 不跑)
+on_arp_keepalive():
+    guests = { v4 ∈ installed }                    # 已過 reconcile 的有效 entry(host-wins 已 skip)
+    if guests 空: return
+    tick += 1
+    neigh = neighbours_v4(up0) − host_ips − guests # 可用 v4 鄰居(防衛性排除自己人)
+    for gw in default_gw4() − neigh:               # gateway 被 GC(host 久無流量)→ 補解析
+        send(up0, arp_request(tpa=gw, spa=host_v4, sha=HOSTMAC))
+        # 回覆 tpa∈host → IN 提早 accept 進 host stack → kernel 自己補鄰居表;下一拍即覆蓋
+    for G in guests:
+        for n in neigh:
+            send(up0, arp_reply(spa=G, sha=HOSTMAC → n))   # 對方 entry → NUD_REACHABLE
+        if tick % 3 == 0:                          # 廣播禮貌:廣播會喚醒整個 WLAN 的 PS client
+            send(up0, garp(G))
+```
+
+- **迴圈安全(天然成立)**:注入 frame `src==HOSTMAC` → egress_guard 不命中;`op=reply` → discovery-dup 只 clone `op==request`,不會被回灌 vmbr。GARP 同(op=2)。
+- **涵蓋範圍**:gateway 100%(host 自身流量使其常駐鄰居表 + 缺席補解析);「只跟 VM 講話、不跟 host 講話」的 LAN peer 不在 host 鄰居表,僅靠 GARP best-effort(STALE 可用但會 flaky)——上限,文件化。
+- **範圍限定 v4**:v6 NS offload 多 slot 無此問題;且 RFC 4861 下 unsolicited NA 不 assert REACHABLE(只有 solicited NA 會),發了沒有等價效果。
+- **mode 無關**(fwd/direct 都可開;頻率與 entry 數成本 = entries × (鄰居數+1) 個 60B frame/拍,可忽略),目標場景是 fwd(Wi-Fi STA)。
+- 成本/功耗:radio 本就每 beacon/DTIM 醒;多送幾個小 frame 遠低於 `powersave off`(常醒)或週期 toggle powersave。
+- 驗證:`func-arp-keepalive.sh`(案例 18)。
+
 ### entry 生命週期(4 操作 × kernel/rust)
 
 決策全在 rust(entries);kernel 只被 syncer 寫/撤 + nft 自動偵測 idle:
@@ -633,8 +674,9 @@ syncer 是**唯一寫/撤 kernel offload 狀態的人**。維護兩份 state、�
 | 15 | fast-path 不進 userspace | 學表後 iperf3:吞吐高、copy/NFLOG 計數幾乎不增(data 留 kernel) |
 | 16 | host→**靜默** VM discovery(僅 fwd) | VM 配 static IP、完全不發包 → host 連 VM:up0-egress discovery dup 把 host 的 ARP/NS clone 到 fwd0 → VM 回應被學、vmroute 建起 → 重試連上(`func-silent-vm.sh`,nft+ebpf) |
 | 17 | offload keepalive(僅 offload) | timeout=5、guest 發包後**靜默 15s**:keepalive probe(timeout/2 週期、fwd0 注入)讓 proxied entry 不被踢 → entry 仍在、**gw→guest 仍通**;guest 釋放 IP 後 ~timeout 被踢、gw→guest 轉不通(`func-offload-workaround.sh` Phase C + `func-offload-keepalive.sh`,nft 含 bpf-blocked) |
+| 18 | ARP keepalive(`--arp-keepalive`) | 等價場景模擬韌體單 v4 slot:**gw egress 只放行 `tpa==host` 的 ARP request、其餘丟**;host↔gw 先通訊建鄰居表;guest 持 permanent gw neigh(不重 ARP 的窗口)。斷言:off → guest↔gw v4 死、gw entry FAILED;`--arp-keepalive 2` → 恢復(單播 reply 解開 FAILED entry),guest **靜默 10s 後** gw entry 仍 REACHABLE、gw→guest 100% 通(`func-arp-keepalive.sh`,nft bpf-blocked + ebpf) |
 
-額外功能腳本(矩陣外、各自 nft+ebpf):`func-silent-vm.sh`(案例 16)、`func-offload-workaround.sh`(`--offload-workaround` / `fwd-with-offload`:apfsim 模擬 APF,gateway→guest off→fail/on→pass + proxy 機制斷言 + Phase C keepalive 案例 17)、`func-offload-keepalive.sh`(案例 17 位址層 + 釋放→踢除,nft 跑在 bpf()-blocked seccomp 下證明 probe 無需 ebpf)。
+額外功能腳本(矩陣外、各自 nft+ebpf):`func-silent-vm.sh`(案例 16)、`func-offload-workaround.sh`(`--offload-workaround` / `fwd-with-offload`:apfsim 模擬 APF,gateway→guest off→fail/on→pass + proxy 機制斷言 + Phase C keepalive 案例 17)、`func-offload-keepalive.sh`(案例 17 位址層 + 釋放→踢除,nft 跑在 bpf()-blocked seccomp 下證明 probe 無需 ebpf)、`func-arp-keepalive.sh`(案例 18,§ARP keepalive)。
 
 ### 測試矩陣:env × engine × mode
 

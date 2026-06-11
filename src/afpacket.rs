@@ -126,6 +126,27 @@ pub fn build_ns(target: Ipv6Addr, src: Ipv6Addr, hostmac: Mac) -> Vec<u8> {
     crate::packet::build_frame(dmac, hostmac, ETHERTYPE_IPV6, &l3)
 }
 
+/// Unsolicited *unicast* ARP reply: "sender_ip is at hostmac", addressed to a specific
+/// neighbour (L2 dst = target_mac). Linux peers set their cache entry to NUD_REACHABLE
+/// on a unicast reply (arp.c: "Broadcast replies and request packets do not assert
+/// neighbour reachability") — the core of the `--arp-keepalive` mechanism.
+pub fn build_arp_reply(sender_ip: Ipv4Addr, hostmac: Mac, target_ip: Ipv4Addr, target_mac: Mac) -> Vec<u8> {
+    let mut f = Vec::with_capacity(42);
+    f.extend_from_slice(target_mac.bytes()); // dst (unicast -> PACKET_HOST at receiver)
+    f.extend_from_slice(hostmac.bytes()); // src
+    f.extend_from_slice(&ETHERTYPE_ARP.to_be_bytes());
+    f.extend_from_slice(&1u16.to_be_bytes()); // htype ethernet
+    f.extend_from_slice(&0x0800u16.to_be_bytes()); // ptype IPv4
+    f.push(6); // hlen
+    f.push(4); // plen
+    f.extend_from_slice(&2u16.to_be_bytes()); // op = reply
+    f.extend_from_slice(hostmac.bytes()); // sha
+    f.extend_from_slice(&sender_ip.octets()); // spa
+    f.extend_from_slice(target_mac.bytes()); // tha
+    f.extend_from_slice(&target_ip.octets()); // tpa
+    f
+}
+
 /// Gratuitous ARP reply: spa=tpa=ip, sha=hostmac, broadcast. Announces ip@hostmac.
 pub fn build_garp(ip: Ipv4Addr, hostmac: Mac) -> Vec<u8> {
     let mut f = Vec::with_capacity(42);
@@ -191,6 +212,26 @@ mod tests {
         assert_eq!(&f[12..14], &ETHERTYPE_ARP.to_be_bytes());
         assert_eq!(&f[28..32], &[10, 0, 0, 5]); // spa
         assert_eq!(&f[38..42], &[10, 0, 0, 5]); // tpa
+    }
+
+    #[test]
+    fn arp_reply_shape() {
+        let hm: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let gw: Mac = "02:00:00:00:00:99".parse().unwrap();
+        let f = build_arp_reply(
+            Ipv4Addr::new(10, 0, 0, 5),
+            hm,
+            Ipv4Addr::new(10, 0, 0, 1),
+            gw,
+        );
+        assert_eq!(f.len(), 42);
+        assert_eq!(&f[0..6], gw.bytes(), "unicast to the neighbour");
+        assert_eq!(&f[6..12], hm.bytes());
+        assert_eq!(&f[20..22], &2u16.to_be_bytes(), "op reply");
+        assert_eq!(&f[22..28], hm.bytes()); // sha
+        assert_eq!(&f[28..32], &[10, 0, 0, 5]); // spa = guest
+        assert_eq!(&f[32..38], gw.bytes()); // tha
+        assert_eq!(&f[38..42], &[10, 0, 0, 1]); // tpa = neighbour
     }
 
     #[test]

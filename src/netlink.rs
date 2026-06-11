@@ -382,6 +382,76 @@ impl Net {
         }
     }
 
+    /// IPv4 default-route gateway addresses (next-hops of 0.0.0.0/0). Used by the
+    /// ARP keepalive to make sure the gateway is always covered even if its neighbour
+    /// entry was garbage-collected. Best-effort: returns empty on any error.
+    pub async fn default_gw4(&self) -> Vec<Ipv4Addr> {
+        use netlink_packet_route::route::RouteAddress;
+        let msg = RouteMessageBuilder::<Ipv4Addr>::new().build();
+        let mut s = self.handle.route().get(msg).execute();
+        let mut out = Vec::new();
+        while let Ok(Some(m)) = s.try_next().await {
+            if m.header.destination_prefix_length != 0 {
+                continue; // only 0.0.0.0/0 (default)
+            }
+            for a in &m.attributes {
+                if let netlink_packet_route::route::RouteAttribute::Gateway(RouteAddress::Inet(g)) =
+                    a
+                {
+                    out.push(*g);
+                }
+            }
+        }
+        out
+    }
+
+    /// Usable IPv4 neighbours on `ifindex`: entries with a link-layer address in a
+    /// not-failed state (REACHABLE/STALE/DELAY/PROBE/PERMANENT). These are the ARP
+    /// keepalive targets. Best-effort: returns empty on any error.
+    pub async fn neighbours_v4(&self, ifindex: u32) -> Vec<(Ipv4Addr, Mac)> {
+        use netlink_packet_route::neighbour::{
+            NeighbourAddress, NeighbourAttribute, NeighbourState,
+        };
+        let mut s = self
+            .handle
+            .neighbours()
+            .get()
+            .set_family(rtnetlink::IpVersion::V4)
+            .execute();
+        let mut out = Vec::new();
+        while let Ok(Some(m)) = s.try_next().await {
+            if m.header.ifindex != ifindex {
+                continue;
+            }
+            let usable = matches!(
+                m.header.state,
+                NeighbourState::Reachable
+                    | NeighbourState::Stale
+                    | NeighbourState::Delay
+                    | NeighbourState::Probe
+                    | NeighbourState::Permanent
+            );
+            if !usable {
+                continue;
+            }
+            let mut ip = None;
+            let mut mac = None;
+            for a in &m.attributes {
+                match a {
+                    NeighbourAttribute::Destination(NeighbourAddress::Inet(d)) => ip = Some(*d),
+                    NeighbourAttribute::LinkLayerAddress(b) => mac = Mac::from_slice(b),
+                    _ => {}
+                }
+            }
+            if let (Some(ip), Some(mac)) = (ip, mac) {
+                if !ip.is_multicast() && !ip.is_broadcast() && !ip.is_unspecified() {
+                    out.push((ip, mac));
+                }
+            }
+        }
+        out
+    }
+
     /// IPv6 default-route gateway addresses (next-hops of ::/0). Used by the
     /// ND-offload proxy guard to never claim the upstream router's own address.
     /// Best-effort: returns empty on any error.
