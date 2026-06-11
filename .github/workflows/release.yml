@@ -1,0 +1,72 @@
+name: release
+
+# Tag a version (e.g. `git tag v0.2.0 && git push --tags`) to cross-build the prebuilt
+# binaries for every target and attach them to a GitHub release. The binary prints its
+# version with `pbridge -v` / `--version`.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # one target failing must not block the others' release
+      matrix:
+        target:
+          - aarch64-linux-android
+          - aarch64-unknown-linux-musl
+          - i686-unknown-linux-musl
+          - x86_64-unknown-linux-musl
+          - arm-unknown-linux-musleabi
+          - armv7-unknown-linux-musleabi
+          - mips-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      # clang is needed by build.rs for the BPF object — on the host for any natively
+      # built target, and (via Cross.toml) inside the cross container for the rest.
+      - name: Install clang (host)
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      # Tier-2 targets have prebuilt std on the pinned 1.91.0 toolchain.
+      # mips-unknown-linux-musl is tier 3 — no prebuilt std, so it needs nightly to
+      # build std from source (-Z build-std).
+      - name: Select toolchain
+        id: tc
+        run: |
+          if [[ "${{ matrix.target }}" == mips-* ]]; then
+            echo "channel=nightly" >> "$GITHUB_OUTPUT"
+            echo "extra=-Z build-std=std,panic_abort" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=1.91.0" >> "$GITHUB_OUTPUT"
+            echo "extra=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build (cross)
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          toolchain: ${{ steps.tc.outputs.channel }}
+          args: "--release --locked ${{ steps.tc.outputs.extra }}"
+
+      - name: Stage artifact
+        run: |
+          set -eu
+          bin="target/${{ matrix.target }}/release/pbridge"
+          out="pbridge-${{ matrix.target }}"
+          cp "$bin" "$out"
+          sha256sum "$out" > "$out.sha256"
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            pbridge-${{ matrix.target }}
+            pbridge-${{ matrix.target }}.sha256

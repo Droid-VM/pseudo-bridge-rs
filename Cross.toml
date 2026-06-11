@@ -1,0 +1,8 @@
+# cross-rs config. build.rs compiles the BPF datapath with clang inside the build
+# container, so every target image needs clang (+ a host-arch asm/types.h, which
+# libc6-dev provides). The BPF object is architecture-independent, so the container's
+# host clang suffices regardless of the Rust target.
+[build]
+pre-build = [
+    "apt-get update && apt-get install --assume-yes --no-install-recommends clang libc6-dev",
+]
