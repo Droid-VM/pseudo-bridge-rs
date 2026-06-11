@@ -18,7 +18,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent
 ART = ROOT / "tests/artifacts"
 AROOT = ART / "aroot"
 ARM = "aarch64-unknown-linux-musl"
@@ -40,7 +40,7 @@ ip link set lo up 2>/dev/null
 export PBRIDGE_BIN=/opt/pb/pbridge UPSIM_BIN=/opt/pb/upsim
 export SUITE_UNSHARE="unshare --mount --net"
 cd /opt/pb/suite
-python3 run.py --gki-guest -j 3
+python3 run_all_test.py --gki-guest -j 3
 echo "@@GKI_EXIT $?"
 sync
 poweroff -f 2>/dev/null
@@ -65,7 +65,7 @@ def _stage():
     shutil.copy(ROOT / f"tools/upsim/target/{ARM}/release/upsim", pbdir / "upsim")
     (pbdir / "pbridge").chmod(0o755)
     (pbdir / "upsim").chmod(0o755)
-    for f in (ROOT / "tests/suite").glob("*.py"):
+    for f in (ROOT / "tests").glob("*.py"):
         shutil.copy(f, suitedir / f.name)
     init = AROOT / "init"
     init.write_text(GKI_INIT)

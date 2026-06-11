@@ -43,4 +43,4 @@ jobs:
       - name: Kernel + capability info (for triage)
         run: uname -r; ip -V; nft --version || true
       - name: Run the suite (host envs)
-        run: sudo -E env "PATH=$PATH" python3 tests/suite/run.py -j 4 --retry 2
+        run: sudo -E env "PATH=$PATH" python3 tests/run_all_test.py -j 4 --retry 2

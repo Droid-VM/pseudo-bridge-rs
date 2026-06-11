@@ -9,7 +9,7 @@ import subprocess
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent
 # Binaries default to the host build tree, but each is overridable so the GKI
 # executor can point at the aarch64 binaries staged inside the guest rootfs.
 BIN = Path(os.environ.get("PBRIDGE_BIN", ROOT / "target/debug/pbridge"))
