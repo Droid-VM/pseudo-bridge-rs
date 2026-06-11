@@ -39,8 +39,9 @@ mkdir -p /dev/net
 ip link set lo up 2>/dev/null
 export PBRIDGE_BIN=/opt/pb/pbridge UPSIM_BIN=/opt/pb/upsim
 export SUITE_UNSHARE="unshare --mount --net"
+export SUITE_TIME_SCALE=3
 cd /opt/pb/suite
-python3 run_all_test.py --gki-guest -j 3
+python3 run_all_test.py --gki-guest -j 1
 echo "@@GKI_EXIT $?"
 sync
 poweroff -f 2>/dev/null

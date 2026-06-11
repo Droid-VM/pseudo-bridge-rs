@@ -58,9 +58,15 @@ def spawn(*args: str, ns: str | None = None, log: str | None = None) -> subproce
     return subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT)
 
 
+# All eventual-success budgets scale by this. The GKI guest runs under QEMU TCG
+# (~20x slower), so it sets SUITE_TIME_SCALE rather than every case hand-tuning a
+# TCG-sized budget. Only polling upper bounds scale; fixed aging sleeps don't.
+TIME_SCALE = float(os.environ.get("SUITE_TIME_SCALE", "1"))
+
+
 def until_ok(budget_s: float, fn, *, interval: float = 0.5) -> bool:
-    """Eventual success: poll `fn` (returning truthy) within `budget_s`."""
-    end = time.monotonic() + budget_s
+    """Eventual success: poll `fn` (returning truthy) within `budget_s` (x TIME_SCALE)."""
+    end = time.monotonic() + budget_s * TIME_SCALE
     while time.monotonic() < end:
         if fn():
             return True

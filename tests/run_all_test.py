@@ -197,13 +197,11 @@ def main():
     t0 = time.monotonic()
     results = {}
 
-    # The whole gki matrix runs in a single QEMU boot, in parallel with the host pool.
-    gki_pool = gki_future = None
-    if gki_units:
-        import gki_run
-        gki_pool = ThreadPoolExecutor(max_workers=1)
-        gki_future = gki_pool.submit(gki_run.run_gki, max(args.timeout * 3, 2400))
-
+    # The gki matrix runs in one QEMU boot AFTER the host pool finishes, not alongside
+    # it: a -j host pool saturates every core, and the aarch64 guest under TCG needs its
+    # vCPU threads to make progress — running them concurrently starves qemu so hard it
+    # can't even boot within the timeout. Sequential keeps total wall acceptable (host
+    # ~minutes, then the guest on a quiet machine) and makes the guest reliable.
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futs = {pool.submit(run_unit, n, e, s, m, g, args.timeout, log_dir, args.retry): n
                 for n, e, s, m, g in host_units}
@@ -230,14 +228,15 @@ def main():
                         pass
             raise
 
-    if gki_future is not None:
-        print("gki: waiting for QEMU boot + matrix (TCG, slow) ...", flush=True)
+    if gki_units:
+        import gki_run
+        print("gki: booting QEMU + running the matrix on the now-quiet machine "
+              "(TCG, slow) ...", flush=True)
         try:
-            gki_res, complete, gki_log = gki_future.result()
+            gki_res, complete, gki_log = gki_run.run_gki(max(args.timeout * 3, 2400))
         except Exception as e:
             print(f"gki: executor crashed: {e}", flush=True)
             gki_res, complete, gki_log = {}, False, "?"
-        gki_pool.shutdown()
         note = "" if complete else "guest did not complete"
         for name, *_ in gki_units:
             ok, cases = gki_res.get(name, (False, {}))
