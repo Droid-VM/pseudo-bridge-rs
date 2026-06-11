@@ -1,0 +1,14 @@
+#!/bin/busybox sh
+/bin/busybox mount -t proc proc /proc 2>/dev/null
+/bin/busybox mount -t sysfs sys /sys 2>/dev/null
+/bin/busybox mount -t devtmpfs dev /dev 2>/dev/null
+echo
+echo "########## REDROID-SH-ON-GKI ##########"
+echo "-- kernel we are running on --"
+/bin/busybox cat /proc/version
+echo "-- run redroid /system/bin/sh (interp -> /system/bin/linker64 -> apex -> bootstrap) --"
+/system/bin/sh -c 'echo REDROID_SYSTEM_BIN_SH_OK; /system/bin/toybox uname -a; echo "id: $(/system/bin/toybox id -u 2>/dev/null)"'
+echo "-- sh exit code: $? --"
+echo "########## DONE ##########"
+/bin/busybox sync
+/bin/busybox poweroff -f

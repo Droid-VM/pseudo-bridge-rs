@@ -1,0 +1,27 @@
+[package]
+name = "pbridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+description = "pseudo-bridge: multi-guest MAC-NAT over a single-MAC upstream (nft / ebpf offload)"
+
+[[bin]]
+name = "pbridge"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "signal"] }
+futures = "0.3"
+rtnetlink = "0.21"
+netlink-packet-route = "0.30"
+aya = "0.13"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true

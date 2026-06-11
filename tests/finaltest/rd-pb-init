@@ -1,0 +1,16 @@
+#!/bin/busybox sh
+# Redroid15 + pbridge smoke: boot GKI, bring up redroid's bionic /system/bin/sh
+# (bootstrap linker chain), then run the static-musl pbridge binary from inside that
+# Android userspace to prove it executes on a real Android rootfs + GKI kernel.
+/bin/busybox mount -t proc proc /proc 2>/dev/null
+/bin/busybox mount -t sysfs sys /sys 2>/dev/null
+/bin/busybox mount -t devtmpfs dev /dev 2>/dev/null
+echo
+echo "########## REDROID-PBRIDGE-ON-GKI ##########"
+/bin/busybox cat /proc/version
+echo "-- redroid /system/bin/sh + pbridge (static) --"
+/system/bin/sh -c 'echo REDROID_SYSTEM_BIN_SH_OK; /opt/pb/pbridge --version && echo PBRIDGE_REDROID_RUN_OK'
+echo "-- pbridge exit: $? --"
+echo "########## DONE ##########"
+/bin/busybox sync
+/bin/busybox poweroff -f
