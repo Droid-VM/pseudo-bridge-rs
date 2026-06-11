@@ -1,26 +1,34 @@
-//! apfsim — a userspace "upstream NIC with ARP/ND offload", for testing pbridge's
-//! `--offload-workaround` faithfully.
+//! upsim — a userspace "single-MAC upstream port" simulator. It is ALWAYS in the path
+//! between pbridge's up0 (the host-side tap, tap2) and the gateway (reached via the
+//! upstream-side tap, tap1, which it bridges to a real upstream interface), and models
+//! the upstream behaviours pbridge has to live with.
 //!
-//! It sits between pbridge's up0 (the host-side tap, tap2) and the gateway (reached via
-//! the upstream-side tap, tap1, which it bridges to a real upstream interface). It models
-//! exactly the Android-APF behaviour that breaks v6 MAC-NAT:
+//! Shared by every mode:
+//!   tap2 -> tap1 (host -> upstream): port security — drop any frame whose src mac !=
+//!                 tap2's mac (HOSTMAC), logging each drop (`--leak-log`). This is both
+//!                 the single-MAC constraint and the suite's unified leak detector.
 //!
-//!   tap2 -> tap1 (host -> upstream): enforce a single source MAC — drop any frame whose
-//!                 src mac != tap2's mac (HOSTMAC). This is the Wi-Fi STA / src-mac port.
-//!   tap1 -> tap2 (upstream -> host): ARP/ND **offload** — for an ARP-request or NS whose
-//!                 *target* is an address currently configured on tap2, answer it directly
-//!                 (ARP reply / NA, with HOSTMAC); for any *other* target, **drop** it
-//!                 (APF's `DROPPED_ARP_OTHER_HOST` / `DROPPED_IPV6_NS_OTHER_HOST`).
-//!                 Everything else is forwarded.
+//! Per-mode inbound behaviour (tap1 -> tap2, upstream -> host):
+//!   portsec      : forward everything (a plain src-mac-pinned switch port — the wired
+//!                 `direct` scenario and the neutral baseline).
+//!   apf (default): ARP/ND offload over ALL addresses currently on tap2 (APF reads the
+//!                 host address table): ARP-request/NS targeting one of them is answered
+//!                 directly with HOSTMAC; any other target is DROPPED (the host never
+//!                 sees it — `DROPPED_*_OTHER_HOST`). pbridge's offload-workaround
+//!                 installs learned guest addrs onto up0(=tap2), so with it ON
+//!                 resolution works and with it OFF it fails — the real APF behaviour.
+//!   qcom         : powersave firmware ARP/NS offload (WMI_SET_ARP_NS_OFFLOAD): the v4
+//!                 answer set is ONLY the host's primary v4 — the first global v4 whose
+//!                 metric != --magic (proxy addrs carry the magic metric and do NOT make
+//!                 it into the single firmware slot); v6 keeps the full set (NS offload
+//!                 has multiple slots, proxies included). Reproduces "v6 fine, v4
+//!                 flaps" — what --arp-keepalive exists for.
 //!
-//! pbridge's workaround installs each learned guest address onto up0 (=tap2); apfsim
-//! detects tap2's address set live (polls), so with the workaround on the guest's address
-//! is offload-answered (resolution works) and without it the guest's NS/ARP is dropped
-//! (resolution fails) — the real failure, reproduced.
-//!
-//!   apfsim --upstream <ifname> [--up-tap tap1] [--host-tap tap2]
+//!   upsim --upstream <ifname> [--up-tap tap1] [--host-tap tap2]
+//!         [--mode portsec|apf|qcom] [--magic N] [--leak-log FILE]
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::process::Command;
@@ -35,6 +43,16 @@ struct HostInfo {
     mac: [u8; 6],
     v4: HashSet<[u8; 4]>,
     v6: HashSet<[u8; 16]>,
+    /// qcom mode: the single firmware v4 slot — the first global v4 whose metric is
+    /// not the proxy magic (i.e. the host's real primary, never a pbridge proxy addr).
+    v4_primary: Option<[u8; 4]>,
+}
+
+#[derive(Copy, Clone, PartialEq)]
+enum Mode {
+    Portsec,
+    Apf,
+    Qcom,
 }
 
 fn tap_open(name: &str) -> OwnedFd {
@@ -71,26 +89,45 @@ fn parse_mac(s: &str) -> [u8; 6] {
     m
 }
 
-/// Read tap2's mac + configured v4/v6 addresses (so proxies appear live).
-fn read_host_info(tap: &str) -> HostInfo {
+/// Current mac of `tap` (fresh sysfs read — used per-frame for src enforcement).
+fn read_mac(tap: &str) -> [u8; 6] {
+    std::fs::read_to_string(format!("/sys/class/net/{tap}/address"))
+        .map(|s| parse_mac(&s))
+        .unwrap_or([0; 6])
+}
+
+/// Read tap2's mac + configured v4/v6 addresses (so proxies appear live). Parsed per
+/// line (`ip -o` = one address per line) so an address's `metric` is associated with
+/// the right address — needed to spot the proxy magic-metric tag.
+fn read_host_info(tap: &str, magic: u32) -> HostInfo {
     let mut hi = HostInfo::default();
     if let Ok(s) = std::fs::read_to_string(format!("/sys/class/net/{tap}/address")) {
         hi.mac = parse_mac(&s);
     }
+    let magic_s = magic.to_string();
     if let Ok(out) = Command::new("ip").args(["-o", "addr", "show", "dev", tap]).output() {
         let text = String::from_utf8_lossy(&out.stdout);
-        let toks: Vec<&str> = text.split_whitespace().collect();
-        for (i, t) in toks.iter().enumerate() {
-            if *t == "inet" {
-                if let Some(a) = toks.get(i + 1).and_then(|x| x.split('/').next()) {
-                    if let Ok(v4) = a.parse::<Ipv4Addr>() {
-                        hi.v4.insert(v4.octets());
+        for line in text.lines() {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            let metric_is_magic = toks
+                .windows(2)
+                .any(|w| w[0] == "metric" && w[1] == magic_s);
+            let global = toks.windows(2).any(|w| w[0] == "scope" && w[1] == "global");
+            for (i, t) in toks.iter().enumerate() {
+                if *t == "inet" {
+                    if let Some(a) = toks.get(i + 1).and_then(|x| x.split('/').next()) {
+                        if let Ok(v4) = a.parse::<Ipv4Addr>() {
+                            hi.v4.insert(v4.octets());
+                            if hi.v4_primary.is_none() && global && !metric_is_magic {
+                                hi.v4_primary = Some(v4.octets());
+                            }
+                        }
                     }
-                }
-            } else if *t == "inet6" {
-                if let Some(a) = toks.get(i + 1).and_then(|x| x.split('/').next()) {
-                    if let Ok(v6) = a.parse::<Ipv6Addr>() {
-                        hi.v6.insert(v6.octets());
+                } else if *t == "inet6" {
+                    if let Some(a) = toks.get(i + 1).and_then(|x| x.split('/').next()) {
+                        if let Ok(v6) = a.parse::<Ipv6Addr>() {
+                            hi.v6.insert(v6.octets());
+                        }
                     }
                 }
             }
@@ -181,6 +218,9 @@ fn main() {
     let mut upstream = None;
     let mut up_tap = "tap1".to_string();
     let mut host_tap = "tap2".to_string();
+    let mut mode = Mode::Apf;
+    let mut magic = 4243672773u32;
+    let mut leak_log: Option<String> = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -196,14 +236,40 @@ fn main() {
                 i += 1;
                 host_tap = argv.get(i).cloned().unwrap_or(host_tap);
             }
+            "--mode" => {
+                i += 1;
+                mode = match argv.get(i).map(String::as_str) {
+                    Some("apf") | None => Mode::Apf,
+                    Some("qcom") => Mode::Qcom,
+                    Some("portsec") => Mode::Portsec,
+                    Some(other) => {
+                        eprintln!("unknown --mode {other} (want portsec|apf|qcom)");
+                        std::process::exit(2);
+                    }
+                };
+            }
+            "--magic" => {
+                i += 1;
+                magic = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(magic);
+            }
+            "--leak-log" => {
+                i += 1;
+                leak_log = argv.get(i).cloned();
+            }
             _ => {}
         }
         i += 1;
     }
     let Some(upstream) = upstream else {
-        eprintln!("usage: apfsim --upstream <ifname> [--up-tap tap1] [--host-tap tap2]");
+        eprintln!(
+            "usage: upsim --upstream <ifname> [--up-tap tap1] [--host-tap tap2] \
+             [--mode portsec|apf|qcom] [--magic N] [--leak-log FILE]"
+        );
         std::process::exit(2);
     };
+    let mut leak_file = leak_log.map(|p| {
+        std::fs::OpenOptions::new().create(true).append(true).open(p).expect("open leak log")
+    });
 
     let up_fd = tap_open(&up_tap); // toward the gateway
     let host_fd = tap_open(&host_tap); // toward pbridge (= up0)
@@ -217,20 +283,25 @@ fn main() {
     ip(&["link", "set", &upstream, "master", "apfbr"]);
     ip(&["link", "set", &upstream, "up"]);
 
-    let host_info = Arc::new(Mutex::new(read_host_info(&host_tap)));
+    let host_info = Arc::new(Mutex::new(read_host_info(&host_tap, magic)));
     {
         // refresh tap2's mac + addresses every 500ms so installed proxies appear.
         let hi = host_info.clone();
         let tap = host_tap.clone();
         std::thread::spawn(move || loop {
-            let fresh = read_host_info(&tap);
+            let fresh = read_host_info(&tap, magic);
             *hi.lock().unwrap() = fresh;
             std::thread::sleep(std::time::Duration::from_millis(500));
         });
     }
 
     eprintln!(
-        "apfsim: {up_tap}(upstream<-{upstream}) <-> {host_tap}(host/up0); offload + single-mac"
+        "upsim: {up_tap}(upstream<-{upstream}) <-> {host_tap}(host/up0); mode={} + single-mac",
+        match mode {
+            Mode::Portsec => "portsec (inbound untouched)",
+            Mode::Apf => "apf (offload: all tap2 addrs)",
+            Mode::Qcom => "qcom (offload: primary v4 + all v6)",
+        }
     );
 
     let up_raw = up_fd.as_raw_fd();
@@ -248,21 +319,44 @@ fn main() {
             }
             break;
         }
-        // host -> upstream: single-MAC filter.
+        // host -> upstream: single-MAC filter; foreign src = leak/spoof -> drop + log.
+        // The enforced mac is read FRESH per frame (cheap sysfs read): real firmware
+        // follows a host mac change synchronously, so the 500ms poll used for the
+        // offload address set must not delay enforcement (it would eat the GARPs
+        // pbridge broadcasts right after a HOSTMAC change).
         if fds[0].revents & libc::POLLIN != 0 {
             drain(host_raw, &mut buf, |f| {
-                let hi = host_info.lock().unwrap();
-                if f.len() >= 12 && f[6..12] == hi.mac {
+                let cur_mac = read_mac(&host_tap);
+                if f.len() >= 14 && f[6..12] == cur_mac {
                     write_frame(up_raw, f); // src == HOSTMAC -> allowed
+                } else if f.len() >= 14 {
+                    if let Some(log) = leak_file.as_mut() {
+                        let t = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
+                        // for v6, log the L3 src too: its EUI-64 identifies the sender
+                        // interface even if the L2 mac has changed since (e.g. a bridge
+                        // adopting a port's mac).
+                        let v6src = if f.len() >= 38 && f[12..14] == [0x86, 0xdd] {
+                            format!(" v6src={}", Ipv6Addr::from(<[u8; 16]>::try_from(&f[22..38]).unwrap()))
+                        } else {
+                            String::new()
+                        };
+                        let _ = writeln!(
+                            log,
+                            "leak t={t} src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ethertype=0x{:02x}{:02x} len={}{v6src}",
+                            f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f.len()
+                        );
+                    }
                 }
-                // else dropped (leak / spoof)
             });
         }
         // upstream -> host: ARP/ND offload.
         if fds[1].revents & libc::POLLIN != 0 {
             drain(up_raw, &mut buf, |f| {
                 let hi = host_info.lock().unwrap();
-                if let Some(action) = offload(f, &hi) {
+                if let Some(action) = offload(f, &hi, mode) {
                     match action {
                         Action::Answer(reply) => write_frame(up_raw, &reply),
                         Action::Drop => {}
@@ -283,9 +377,9 @@ enum Action {
 }
 
 /// Decide the offload action for an upstream->host frame. `None` == plain forward.
-fn offload(f: &[u8], hi: &HostInfo) -> Option<Action> {
-    if f.len() < 14 {
-        return Some(Action::Forward);
+fn offload(f: &[u8], hi: &HostInfo, mode: Mode) -> Option<Action> {
+    if mode == Mode::Portsec || f.len() < 14 {
+        return Some(Action::Forward); // portsec: inbound untouched
     }
     let ethtype = u16::from_be_bytes([f[12], f[13]]);
     match ethtype {
@@ -296,17 +390,23 @@ fn offload(f: &[u8], hi: &HostInfo) -> Option<Action> {
             }
             let mut tpa = [0u8; 4];
             tpa.copy_from_slice(&f[38..42]);
-            if hi.v4.contains(&tpa) {
+            // qcom: the firmware holds ONE v4 slot — only the host's real primary.
+            let known = match mode {
+                Mode::Qcom => hi.v4_primary.as_ref() == Some(&tpa),
+                _ => hi.v4.contains(&tpa),
+            };
+            if known {
                 Some(Action::Answer(build_arp_reply(f, &hi.mac))) // offload
             } else {
-                Some(Action::Drop) // ARP_OTHER_HOST
+                Some(Action::Drop) // ARP_OTHER_HOST / powersave drop
             }
         }
         0x86dd if f.len() >= 78 && f[20] == 58 && f[54] == 135 => {
             let mut tgt = [0u8; 16];
             tgt.copy_from_slice(&f[62..78]);
+            // apf AND qcom answer over the FULL v6 set (NS offload is multi-slot).
             let known = hi.v6.contains(&tgt);
-            if std::env::var("APFSIM_DEBUG").is_ok() {
+            if std::env::var("UPSIM_DEBUG").is_ok() {
                 eprintln!("NS target={} known={known} v6set={}", Ipv6Addr::from(tgt), hi.v6.len());
             }
             if known {
@@ -315,7 +415,7 @@ fn offload(f: &[u8], hi: &HostInfo) -> Option<Action> {
                     None => Some(Action::Forward),        // DAD NS
                 }
             } else {
-                Some(Action::Drop) // NS_OTHER_HOST
+                Some(Action::Drop) // NS_OTHER_HOST / powersave drop
             }
         }
         _ => Some(Action::Forward),

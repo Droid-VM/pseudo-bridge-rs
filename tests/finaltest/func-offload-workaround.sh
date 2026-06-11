@@ -16,7 +16,7 @@
 set -u
 ROOT=/root/gitrs/pseudo-bridge-rs
 BIN=${BIN:-$ROOT/target/debug/pbridge}
-APFSIM=${APFSIM:-$ROOT/tools/apfsim/target/x86_64-unknown-linux-musl/release/apfsim}
+APFSIM=${APFSIM:-$ROOT/tools/upsim/target/x86_64-unknown-linux-musl/release/upsim}
 ENGINE=${1:-nft}
 HMAC=02:00:00:00:00:01
 MAGIC=4243672773
@@ -29,7 +29,7 @@ cleanup(){ for p in "$PB" "$AP"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
            for n in apfup apfhost apfg1; do ip netns del $n 2>/dev/null; done; }
 trap cleanup EXIT
 
-[ -x "$APFSIM" ] || { echo "building apfsim..."; (cd "$ROOT/tools/apfsim" && cargo build --release --target x86_64-unknown-linux-musl >/dev/null 2>&1); }
+[ -x "$APFSIM" ] || { echo "building apfsim..."; (cd "$ROOT/tools/upsim" && cargo build --release --target x86_64-unknown-linux-musl >/dev/null 2>&1); }
 [ -x "$APFSIM" ] || { echo "no apfsim at $APFSIM"; exit 1; }
 [ -x "$BIN" ] || { echo "no pbridge at $BIN (cargo build)"; exit 1; }
 

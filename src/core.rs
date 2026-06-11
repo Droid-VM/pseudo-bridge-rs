@@ -402,11 +402,6 @@ impl Core {
     }
 
     async fn init_session(&mut self) -> Result<()> {
-        // direct: the guest-facing port that joins the bridge is up0 itself.
-        if !self.is_fwd() {
-            let up0 = self.cli.interface.clone();
-            self.ensure_bridge(&up0).await;
-        }
         let snap = self.recompute().await?;
         if !snap.up0_present {
             return Ok(());
@@ -444,8 +439,6 @@ impl Core {
             if fwd0_index.is_none() {
                 anyhow::bail!("fwd mode: could not create/resolve fwd0 {}", fwd0);
             }
-            // fwd: the guest-facing port is fwd1 (just recreated, so never enslaved yet).
-            self.ensure_bridge(&fwd1).await;
         }
 
         // recompute again to pick up fwd0's index / any master already present.
@@ -474,6 +467,14 @@ impl Core {
         self.backend.init(&cfg, self.copy_tx.clone())?;
         self.initialized = true;
         self.snap = snap;
+
+        // --bridge: enslave the guest-facing port only now, AFTER the hooks are live —
+        // otherwise (direct especially) there's a window where the kernel bridge floods
+        // unrewritten guest frames out up0. The resulting netlink change flows through
+        // the same dynamic attach path as an operator enslave (BRMAC/HOSTMAC/mirror).
+        let guest_port =
+            if self.is_fwd() { self.cli.fwd1() } else { self.cli.interface.clone() };
+        self.ensure_bridge(&guest_port).await;
 
         // fwd: add ip rules (idempotent) + mirror up0 IPs to br.
         if self.is_fwd() {

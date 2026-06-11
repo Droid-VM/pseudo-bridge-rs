@@ -129,12 +129,12 @@ def prebuild():
     """Build everything units depend on, once, before going parallel."""
     print("prebuild: cargo build (pbridge) ...", flush=True)
     subprocess.run(["cargo", "build"], cwd=ROOT, check=True)
-    apfsim = ROOT / "tools/apfsim/target/x86_64-unknown-linux-musl/release/apfsim"
+    apfsim = ROOT / "tools/upsim/target/x86_64-unknown-linux-musl/release/upsim"
     if not apfsim.exists():
         print("prebuild: cargo build (apfsim, musl) ...", flush=True)
         subprocess.run(
             ["cargo", "build", "--release", "--target", "x86_64-unknown-linux-musl"],
-            cwd=ROOT / "tools/apfsim", check=True,
+            cwd=ROOT / "tools/upsim", check=True,
         )
     noebpf = ROOT / FT / "noebpf"
     if not noebpf.exists():

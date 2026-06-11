@@ -147,7 +147,11 @@ pub fn build_arp_reply(sender_ip: Ipv4Addr, hostmac: Mac, target_ip: Ipv4Addr, t
     f
 }
 
-/// Gratuitous ARP reply: spa=tpa=ip, sha=hostmac, broadcast. Announces ip@hostmac.
+/// Gratuitous ARP reply: spa=tpa=ip, sha=tha=hostmac, broadcast L2 dst.
+/// tha MUST equal sha: Linux's arp_is_garp() only honors a gratuitous *reply* when
+/// `tha == sha` — with tha=ff:ff:.. the frame is treated as an ordinary broadcast
+/// reply and (with default sysctls) neither creates nor overrides an entry, so the
+/// per-entry announcement on HOSTMAC change would heal nothing.
 pub fn build_garp(ip: Ipv4Addr, hostmac: Mac) -> Vec<u8> {
     let mut f = Vec::with_capacity(42);
     f.extend_from_slice(Mac::BROADCAST.bytes()); // dst
@@ -161,7 +165,7 @@ pub fn build_garp(ip: Ipv4Addr, hostmac: Mac) -> Vec<u8> {
     f.extend_from_slice(&2u16.to_be_bytes()); // op = reply (gratuitous)
     f.extend_from_slice(hostmac.bytes()); // sha
     f.extend_from_slice(&ip.octets()); // spa
-    f.extend_from_slice(Mac::BROADCAST.bytes()); // tha
+    f.extend_from_slice(hostmac.bytes()); // tha = sha (arp_is_garp requirement)
     f.extend_from_slice(&ip.octets()); // tpa
     f
 }
@@ -211,6 +215,7 @@ mod tests {
         assert_eq!(&f[6..12], mac.bytes());
         assert_eq!(&f[12..14], &ETHERTYPE_ARP.to_be_bytes());
         assert_eq!(&f[28..32], &[10, 0, 0, 5]); // spa
+        assert_eq!(&f[32..38], mac.bytes()); // tha == sha (arp_is_garp)
         assert_eq!(&f[38..42], &[10, 0, 0, 5]); // tpa
     }
 

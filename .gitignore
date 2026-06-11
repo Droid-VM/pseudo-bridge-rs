@@ -1,3 +1,6 @@
 target/
 /dist/
 tests/artifacts/
+
+__pycache__/
+*.pyc
