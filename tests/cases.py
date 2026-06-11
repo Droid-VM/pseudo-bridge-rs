@@ -224,11 +224,23 @@ def hostmac_change(c: Ctx):
 @case(requires=v4_actively_resolvable,
       desc="guest adds an IP: learned, usable")
 def ip_change(c: Ctx):
-    sh("ip", "-n", "vm1", "addr", "add", "10.0.0.55/24", "dev", "eth0")
+    new = "10.0.0.55"
+    sh("ip", "-n", "vm1", "addr", "add", f"{new}/24", "dev", "eth0")
     try:
-        expect_ping("vm1", GW4, "vm1's new ip reaches gw", src="10.0.0.55")
+        if not until_ok(15, lambda: ping("vm1", GW4, src=new)):
+            # On-failure diagnostics (the GKI fwd-with-offload case fails here): show
+            # whether the new addr got learned (vmroute), proxied onto up0, and how the
+            # gateway resolved it.
+            up0 = sh("ip", "-n", "phone", "-o", "addr", "show", "dev", "up0").stdout
+            proxy = [l.split() for l in up0.splitlines() if new in l]
+            gwn = sh("ip", "-n", "gw", "neigh", "show").stdout
+            gwn = [l for l in gwn.splitlines() if new in l]
+            t200 = sh("ip", "-n", "phone", "route", "show", "table", "200").stdout
+            vmr = [l for l in t200.splitlines() if new in l]
+            raise Fail(f"vm1 new ip {new} unreachable | up0_proxy={proxy} | "
+                       f"gw_neigh={gwn} | vmroute={vmr}")
     finally:
-        sh("ip", "-n", "vm1", "addr", "del", "10.0.0.55/24", "dev", "eth0")
+        sh("ip", "-n", "vm1", "addr", "del", f"{new}/24", "dev", "eth0")
 
 
 # After the entry ages out and the guest goes quiet, reconnecting means the gw must

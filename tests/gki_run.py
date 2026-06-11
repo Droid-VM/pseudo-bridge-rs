@@ -120,8 +120,12 @@ def run_gki(timeout: int = 2400):
         "-kernel", str(ART / "Image"), "-initrd", str(cpio),
         "-append", "console=ttyAMA0 rdinit=/init panic=1",
     ]
+    # stdin=DEVNULL is essential: qemu -nographic puts the serial console on stdio, so
+    # with an inherited terminal stdin it gets SIGTTIN and STOPS (0 console output, hangs
+    # to timeout) when run in the foreground. /dev/null stdin avoids that — works in
+    # foreground and background alike.
     with open(log, "w") as f:
-        subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT)
     text = log.read_text(errors="replace")
     units = _parse(text)
     complete = "@@GKI_COMPLETE" in text
