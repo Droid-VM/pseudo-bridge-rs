@@ -723,12 +723,11 @@ impl Core {
         }
         self.keepalive_tick = self.keepalive_tick.wrapping_add(1);
         let garp_tick = self.keepalive_tick.is_multiple_of(GARP_EVERY);
+        let Some(hostmac) = self.snap.hostmac else { return Ok(()) };
 
-        let mut neigh = self.net.neighbours_v4(self.snap.up0_index).await;
-        let host = self.snap.host_ip_set();
-        neigh.retain(|(ip, _)| {
-            !host.contains(&IpAddr::V4(*ip)) && !self.installed.contains_key(&IpAddr::V4(*ip))
-        });
+        // Neighbours resolving to HOSTMAC (host's own addrs, MAC-NAT'd guests) are "us",
+        // not peers — neighbours_v4 filters them out during the scan.
+        let neigh = self.net.neighbours_v4(self.snap.up0_index, hostmac).await;
         let have: HashSet<Ipv4Addr> = neigh.iter().map(|(ip, _)| *ip).collect();
         let missing_gws: Vec<Ipv4Addr> = self
             .net
@@ -743,7 +742,6 @@ impl Core {
         });
 
         let Some(inj) = &self.injector else { return Ok(()) };
-        let Some(hostmac) = self.snap.hostmac else { return Ok(()) };
         for gw in missing_gws {
             if let Some(src) = host_v4 {
                 let _ = inj.send_frame(&build_arp_request(gw, src, hostmac));

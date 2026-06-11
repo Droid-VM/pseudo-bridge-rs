@@ -407,8 +407,11 @@ impl Net {
 
     /// Usable IPv4 neighbours on `ifindex`: entries with a link-layer address in a
     /// not-failed state (REACHABLE/STALE/DELAY/PROBE/PERMANENT). These are the ARP
-    /// keepalive targets. Best-effort: returns empty on any error.
-    pub async fn neighbours_v4(&self, ifindex: u32) -> Vec<(Ipv4Addr, Mac)> {
+    /// keepalive targets. Entries whose lladdr == `exclude_lladdr` (HOSTMAC) are
+    /// filtered out during the scan: anything resolving to our own mac — host
+    /// addresses, MAC-NAT'd guests — is "us", not a peer to refresh.
+    /// Best-effort: returns empty on any error.
+    pub async fn neighbours_v4(&self, ifindex: u32, exclude_lladdr: Mac) -> Vec<(Ipv4Addr, Mac)> {
         use netlink_packet_route::neighbour::{
             NeighbourAddress, NeighbourAttribute, NeighbourState,
         };
@@ -444,7 +447,11 @@ impl Net {
                 }
             }
             if let (Some(ip), Some(mac)) = (ip, mac) {
-                if !ip.is_multicast() && !ip.is_broadcast() && !ip.is_unspecified() {
+                if mac != exclude_lladdr
+                    && !ip.is_multicast()
+                    && !ip.is_broadcast()
+                    && !ip.is_unspecified()
+                {
                     out.push((ip, mac));
                 }
             }

@@ -566,8 +566,8 @@ syncer 是**唯一寫/撤 kernel offload 狀態的人**。維護兩份 state、�
 **模組落點**:
 
     cli      : --arp-keepalive <secs>(0=off 預設;Android Wi-Fi 建議 10)
-    netlink  : default_gw4()(同 default_gw6 的 v4 版)+ neighbours_v4(ifindex)
-               (RTM_GETNEIGH dump:取有 lladdr 且 state ∈ REACHABLE/STALE/DELAY/PROBE/PERMANENT 者)
+    netlink  : default_gw4()(同 default_gw6 的 v4 版)+ neighbours_v4(ifindex, exclude_lladdr=HOSTMAC)
+               (RTM_GETNEIGH dump:取有 lladdr 且 state ∈ REACHABLE/STALE/DELAY/PROBE/PERMANENT、且 lladdr ≠ HOSTMAC 者)
     afpacket : build_arp_reply(spa=G, sha=HOSTMAC, tpa=n.ip, tha=n.mac, L2dst=n.mac)(單播);GARP 用既有 build_garp
     core     : 獨立 interval timer(MissedTickBehavior::Delay),經 up0 Injector(AF_PACKET)注入
 
@@ -577,7 +577,8 @@ on_arp_keepalive():
     guests = { v4 ∈ installed }                    # 已過 reconcile 的有效 entry(host-wins 已 skip)
     if guests 空: return
     tick += 1
-    neigh = neighbours_v4(up0) − host_ips − guests # 可用 v4 鄰居(防衛性排除自己人)
+    neigh = neighbours_v4(up0, 濾掉 lladdr==HOSTMAC) # 自己人(host 自有位址、MAC-NAT 後的 guest)的
+                                                     #   鄰居項必指 HOSTMAC → 掃描時直接排除,免事後集合相減
     for gw in default_gw4() − neigh:               # gateway 被 GC(host 久無流量)→ 補解析
         send(up0, arp_request(tpa=gw, spa=host_v4, sha=HOSTMAC))
         # 回覆 tpa∈host → IN 提早 accept 進 host stack → kernel 自己補鄰居表;下一拍即覆蓋
