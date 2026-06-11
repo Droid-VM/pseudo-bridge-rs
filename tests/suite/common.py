@@ -19,7 +19,12 @@ HOST4, HOST6 = "10.0.0.2", "fd00::2"
 VM1_4, VM1_6 = "10.0.0.5", "fd00::5"
 VM2_4, VM2_6 = "10.0.0.6", "fd00::6"
 VM3_4, VM3_6 = "10.0.0.7", "fd00::7"
-NS_ALL = ("gw", "phone", "vm1", "vm2", "vm3")
+# wan-segment "household" devices (siblings of the gw, NOT behind the MAC-NAT)
+NEIGH1_4, NEIGH1_6 = "10.0.0.8", "fd00::8"
+NEIGH2_4, NEIGH2_6 = "10.0.0.9", "fd00::9"
+# the address that hops VM -> neigh in the handover case
+HANDOVER_4, HANDOVER_6 = "10.0.0.50", "fd00::50"
+NS_ALL = ("gw", "phone", "vm1", "vm2", "vm3", "neigh1", "neigh2")
 LEAK_LOG = Path("/tmp/upsim-leak.log")
 MAGIC = "4243672773"
 

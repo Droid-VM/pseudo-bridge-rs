@@ -15,8 +15,8 @@ import subprocess
 import time
 
 from common import (
-    GW4, GW6, HMAC, HOST4, HOST6, LEAK_LOG, NS_ALL, UPSIM,
-    VM1_4, VM1_6, VM2_4, VM2_6, sh, sh_ok, spawn, until_ok,
+    GW4, GW6, HMAC, HOST4, HOST6, LEAK_LOG, NEIGH1_4, NEIGH1_6, NEIGH2_4, NEIGH2_6,
+    NS_ALL, UPSIM, VM1_4, VM1_6, VM2_4, VM2_6, sh, sh_ok, spawn, until_ok,
 )
 
 
@@ -30,12 +30,34 @@ class Topo:
     def up(self):
         for n in NS_ALL:
             sh("ip", "netns", "add", n, check=True)
+        # The wan segment is a real bridge in the gw ns modelling a home network: the
+        # router (gw), two household devices (neigh1/neigh2), and the phone's uplink
+        # (wanport<->real_up0) all share one L2 segment. The phone's single-MAC /
+        # offload constraints live only on real_up0<->up0 (upsim); the gw<->neigh links
+        # are ordinary. neigh1/neigh2 are NOT behind the MAC-NAT.
+        sh("ip", "-n", "gw", "link", "add", "wanbr", "type", "bridge", check=True)
+        sh("ip", "-n", "gw", "link", "set", "wanbr", "up")
+        sh("ip", "-n", "gw", "link", "set", "lo", "up")
         sh("ip", "link", "add", "wanport", "netns", "gw", "type", "veth",
            "peer", "name", "real_up0", "netns", "phone", check=True)
-        sh("ip", "-n", "gw", "addr", "add", f"{GW4}/24", "dev", "wanport")
-        sh("ip", "-n", "gw", "addr", "add", f"{GW6}/64", "dev", "wanport", "nodad")
+        sh("ip", "-n", "gw", "link", "set", "wanport", "master", "wanbr")
         sh("ip", "-n", "gw", "link", "set", "wanport", "up")
-        sh("ip", "-n", "gw", "link", "set", "lo", "up")
+        # gw's own addresses live on the bridge
+        sh("ip", "-n", "gw", "addr", "add", f"{GW4}/24", "dev", "wanbr")
+        sh("ip", "-n", "gw", "addr", "add", f"{GW6}/64", "dev", "wanbr", "nodad")
+        # household devices on the wan segment
+        for nsname, n4, n6, link in (
+            ("neigh1", NEIGH1_4, NEIGH1_6, "n1"),
+            ("neigh2", NEIGH2_4, NEIGH2_6, "n2"),
+        ):
+            sh("ip", "link", "add", link, "netns", "gw", "type", "veth",
+               "peer", "name", "eth0", "netns", nsname, check=True)
+            sh("ip", "-n", "gw", "link", "set", link, "master", "wanbr")
+            sh("ip", "-n", "gw", "link", "set", link, "up")
+            sh("ip", "-n", nsname, "addr", "add", f"{n4}/24", "dev", "eth0")
+            sh("ip", "-n", nsname, "addr", "add", f"{n6}/64", "dev", "eth0", "nodad")
+            sh("ip", "-n", nsname, "link", "set", "eth0", "up")
+            sh("ip", "-n", nsname, "link", "set", "lo", "up")
         # learning-switch model: honor GARP/unsolicited-NA at once (a real AP re-learns
         # from the source mac; a Linux gw would otherwise hold stale entries to NUD timeout)
         sh("sysctl", "-q", "net.ipv4.conf.all.arp_accept=1",
@@ -120,11 +142,23 @@ class Topo:
 
     @staticmethod
     def flush_gw_neigh():
-        sh("ip", "-n", "gw", "neigh", "flush", "dev", "wanport")
-        sh("ip", "-n", "gw", "-6", "neigh", "flush", "dev", "wanport")
+        sh("ip", "-n", "gw", "neigh", "flush", "dev", "wanbr")
+        sh("ip", "-n", "gw", "-6", "neigh", "flush", "dev", "wanbr")
 
     @staticmethod
     def gw_neigh(ip: str) -> str:
         """The gw's neighbour entry line for `ip` ('' if none)."""
-        r = sh("ip", "-n", "gw", "neigh", "show", "dev", "wanport", ip)
+        r = sh("ip", "-n", "gw", "neigh", "show", "dev", "wanbr", ip)
         return r.stdout.strip()
+
+    @staticmethod
+    def mac_of(ns: str, dev: str = "eth0") -> str:
+        out = sh("ip", "-n", ns, "-br", "link", "show", dev).stdout.split()
+        return out[2] if len(out) > 2 else ""
+
+    @staticmethod
+    def neigh_lladdr(viewer_ns: str, ip: str) -> str:
+        """`ip`'s resolved lladdr as seen from `viewer_ns` ('' if unresolved)."""
+        r = sh("ip", "-n", viewer_ns, "neigh", "show", ip)
+        toks = r.stdout.split()
+        return toks[toks.index("lladdr") + 1] if "lladdr" in toks else ""

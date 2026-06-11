@@ -14,7 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from common import (
-    GW4, GW6, MAGIC, VM1_4, VM1_6, VM2_4, VM2_6, VM3_4, VM3_6,
+    GW4, GW6, HANDOVER_4, HANDOVER_6, MAGIC, NEIGH1_4, NEIGH2_4,
+    VM1_4, VM1_6, VM2_4, VM2_6, VM3_4, VM3_6,
     Fail, expect, expect_no_ping, expect_ping, leak_count, ping, sh, sh_ok, until_ok,
 )
 from pb import PB_TIMEOUT, Pbridge
@@ -76,6 +77,12 @@ def ping_all(ns: str, dst: str, count: int = 3) -> bool:
     return r.returncode == 0 and " 0% packet loss" in r.stdout
 
 
+def vmroute_present(ip: str) -> bool:
+    """Is there a per-guest vmroute for `ip` (fwd /32-/128, default table 200)?"""
+    out = sh("ip", "route", "show", "table", "200", ns="phone").stdout
+    return ip in out
+
+
 # ---------------------------------------------------------------- basics
 
 @case(desc="guest v4 -> gw (ARP rewrite + demux)")
@@ -119,6 +126,15 @@ def multi_guest(c: Ctx):
     expect(VM2_4 not in out, "vm1<->vm2 traffic leaked onto the wan")
 
 
+@case(desc="wan household coexistence: gw + two neighbours + a guest all reachable")
+def neigh_coexist(c: Ctx):
+    # the wan segment has the router and two ordinary devices (not behind the MAC-NAT)
+    expect_ping("gw", NEIGH1_4, "gw -> neigh1", budget=10)
+    expect_ping("gw", NEIGH2_4, "gw -> neigh2", budget=10)
+    # a guest reaches a wan neighbour through the MAC-NAT (same path as guest->gw)
+    expect_ping("vm1", NEIGH1_4, "vm1 -> neigh1 (v4, through MAC-NAT)")
+
+
 # ---------------------------------------------------------------- silent VM / DHCP
 
 @case(requires=lambda c: c.mode != "direct",
@@ -127,9 +143,11 @@ def silent_vm(c: Ctx):
     sh("ip", "-n", "vm3", "addr", "add", f"{VM3_4}/24", "dev", "eth0")
     sh("ip", "-n", "vm3", "addr", "add", f"{VM3_6}/64", "dev", "eth0", "nodad")
     sh("ip", "-n", "vm3", "link", "set", "eth0", "up")
-    # vm3 never initiates; connectivity comes up "on retry" via the discovery dup
-    expect_ping("phone", VM3_4, "phone -> silent vm3 v4", budget=20)
-    expect_ping("phone", VM3_6, "phone -> silent vm3 v6", budget=20)
+    # vm3 never initiates; connectivity comes up "on retry" via the discovery dup. v6
+    # is slower (ND + solicited-node), and under parallel CPU saturation the discovery
+    # round-trip stretches — generous budgets keep it an eventual-success assertion.
+    expect_ping("phone", VM3_4, "phone -> silent vm3 v4", budget=30)
+    expect_ping("phone", VM3_6, "phone -> silent vm3 v6", budget=30)
 
 
 @case(requires=lambda c: shutil.which("dnsmasq") and shutil.which("busybox"),
@@ -137,23 +155,31 @@ def silent_vm(c: Ctx):
 def dhcp_v4(c: Ctx):
     sh("ip", "-n", "vm3", "addr", "flush", "dev", "eth0")
     sh("ip", "-n", "vm3", "link", "set", "eth0", "up")
+    # The lease file MUST live in the unit-private /tmp: `unshare --mount` gives each
+    # unit its own /tmp + /run/netns but /var is SHARED, so dnsmasq's default
+    # /var/lib/misc/dnsmasq.leases would be common to all parallel units — they'd
+    # accumulate each other's leases and exhaust the small range ("no address
+    # available"). --dhcp-authoritative + --no-ping keep allocation fast and decisive.
     dns = subprocess.Popen(
-        ["ip", "netns", "exec", "gw", "dnsmasq", "--no-daemon", "--interface=wanport",
-         "--bind-interfaces", "--port=0",
+        ["ip", "netns", "exec", "gw", "dnsmasq", "--no-daemon", "--interface=wanbr",
+         "--bind-interfaces", "--port=0", "--no-ping", "--dhcp-authoritative",
+         "--dhcp-leasefile=/tmp/dnsmasq.leases",
          "--dhcp-range=10.0.0.100,10.0.0.150,255.255.255.0,12h"],
         stdout=open("/tmp/dnsmasq.log", "w"), stderr=subprocess.STDOUT)
     try:
-        time.sleep(0.5)
+        time.sleep(1.5)  # let dnsmasq bind before soliciting
         script = Path("/tmp/udhcpc.sh")
         script.write_text(
             '#!/bin/sh\ncase "$1" in bound|renew) '
             'ip addr add "$ip/${mask:-24}" dev "$interface" 2>/dev/null; '
             'echo "$ip" >/tmp/dhcp-lease;; esac\nexit 0\n')
         script.chmod(0o755)
-        Path("/tmp/dhcp-lease").unlink(missing_ok=True)
+        lease = Path("/tmp/dhcp-lease")
+        lease.unlink(missing_ok=True)
+        # udhcpc's own retries (-t 6, -T 2) ride out a transiently busy handshake; the
+        # lease file being private means a clean range every run, so this rarely retries.
         sh("busybox", "udhcpc", "-i", "eth0", "-s", str(script),
            "-n", "-q", "-t", "6", "-T", "2", ns="vm3")
-        lease = Path("/tmp/dhcp-lease")
         expect(lease.exists() and lease.read_text().strip(),
                "no DHCPv4 lease (see /tmp/dnsmasq.log)")
         ip = lease.read_text().strip()
@@ -271,7 +297,7 @@ def offload_keepalive(c: Ctx):
 # i.e. it is not re-ARPing right now).
 
 def _gw_mac() -> str:
-    out = sh("ip", "-n", "gw", "-br", "link", "show", "wanport").stdout.split()
+    out = sh("ip", "-n", "gw", "-br", "link", "show", "wanbr").stdout.split()
     return out[2] if len(out) > 2 else ""
 
 
@@ -279,11 +305,11 @@ def _gw_mac() -> str:
       desc="qcom single-v4-slot: without --arp-keepalive the gw entry dies")
 def arp_keepalive_broken(c: Ctx):
     # fast NUD decay on the gw
-    sh("sysctl", "-q", "net.ipv4.neigh.wanport.base_reachable_time_ms=3000",
-       "net.ipv4.neigh.wanport.delay_first_probe_time=1",
-       "net.ipv4.neigh.wanport.retrans_time_ms=200",
-       "net.ipv4.neigh.wanport.ucast_solicit=2",
-       "net.ipv4.neigh.wanport.mcast_solicit=2", ns="gw")
+    sh("sysctl", "-q", "net.ipv4.neigh.wanbr.base_reachable_time_ms=3000",
+       "net.ipv4.neigh.wanbr.delay_first_probe_time=1",
+       "net.ipv4.neigh.wanbr.retrans_time_ms=200",
+       "net.ipv4.neigh.wanbr.ucast_solicit=2",
+       "net.ipv4.neigh.wanbr.mcast_solicit=2", ns="gw")
     expect_ping("vm1", GW4, "learn vm1 v4 first")
     sh("ip", "-n", "vm1", "neigh", "replace", GW4, "lladdr", _gw_mac(),
        "dev", "eth0", "nud", "permanent")
@@ -319,6 +345,56 @@ def arp_keepalive_hold(c: Ctx):
     expect(until_ok(4, lambda: "REACHABLE" in c.topo.gw_neigh(VM1_4)),
            "gw entry re-asserted REACHABLE within one keepalive period")
     expect(ping_all("gw", VM1_4), "gw -> vm1 at 100% while vm1 stays silent")
+
+
+# ---------------------------------------------------------- IP handover (release)
+
+@case(requires=lambda c: c.mode != "direct",
+      desc="VM releases an IP, a wan neighbour takes it over: timeout withdraws every "
+           "trace (demux/proxy/vmroute) so phone, gw AND vm2 all reach the new owner")
+def ip_handover(c: Ctx):
+    X4, X6 = HANDOVER_4, HANDOVER_6
+    # vm3 briefly owns X; learning it installs the demux entry, the vmroute, and (when
+    # offloaded) the proxy address on up0.
+    sh("ip", "-n", "vm3", "addr", "flush", "dev", "eth0")
+    sh("ip", "-n", "vm3", "addr", "add", f"{X4}/24", "dev", "eth0")
+    sh("ip", "-n", "vm3", "addr", "add", f"{X6}/64", "dev", "eth0", "nodad")
+    sh("ip", "-n", "vm3", "link", "set", "eth0", "up")
+    expect_ping("vm3", GW4, "vm3 learns X (v4)")
+    if c.sim != "qcom":
+        expect_ping("vm3", GW6, "vm3 learns X (v6)")
+    if offloaded(c):
+        expect(until_ok(8, lambda: proxies(X4)), "X proxied onto up0 while vm3 owns it")
+    expect(until_ok(8, lambda: vmroute_present(X4)), "vmroute for X present while vm3 owns it")
+
+    # vm3 releases X and stays silent — the entry must age out.
+    sh("ip", "-n", "vm3", "addr", "flush", "dev", "eth0")
+    if offloaded(c):
+        expect(until_ok(2.5 * PB_TIMEOUT + 2,
+                        lambda: not proxies(X4) and not proxies(X6)),
+               "proxy addrs removed from up0 after release")
+    else:
+        time.sleep(2 * PB_TIMEOUT + 2)
+    expect(until_ok(PB_TIMEOUT, lambda: not vmroute_present(X4)),
+           "stale vmroute for X withdrawn after release")
+
+    # a wan neighbour takes X over (secondary on its eth0).
+    sh("ip", "-n", "neigh1", "addr", "add", f"{X4}/24", "dev", "eth0")
+    sh("ip", "-n", "neigh1", "addr", "add", f"{X6}/64", "dev", "eth0", "nodad")
+    nmac = c.topo.mac_of("neigh1")
+    try:
+        # phone (the host itself), gw (upstream), and vm2 (another guest) must all reach
+        # the NEW owner and resolve X to neigh1's mac — never a stale vm3 entry, and
+        # never the phone (HOSTMAC), which a leftover up0 proxy would cause.
+        for viewer in ("phone", "gw", "vm2"):
+            sh("ip", "-n", viewer, "neigh", "flush", "all")
+            expect_ping(viewer, X4, f"{viewer} -> X (now neigh1) after handover", budget=15)
+            lladdr = c.topo.neigh_lladdr(viewer, X4).lower()
+            expect(lladdr == nmac.lower(),
+                   f"{viewer} resolves X to neigh1 {nmac}, not stale/HOSTMAC (got {lladdr!r})")
+    finally:
+        sh("ip", "-n", "neigh1", "addr", "del", f"{X4}/24", "dev", "eth0")
+        sh("ip", "-n", "neigh1", "addr", "del", f"{X6}/64", "dev", "eth0")
 
 
 # ---------------------------------------------------------------- final guard

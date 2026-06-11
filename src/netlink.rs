@@ -333,14 +333,22 @@ impl Net {
     }
 
     pub async fn route_del(&self, dst: IpAddr, plen: u8, table: u32) -> Result<()> {
+        // The route we add is scope=link/proto=static, but the builder defaults to
+        // scope=universe — and the kernel matches DELROUTE on scope, so a scope-less
+        // delete silently misses (ESRCH) and the route leaks. Wildcard scope (NoWhere)
+        // + proto (Unspec) like `ip route del` does, so dst+table is enough to match.
         let msg = match dst {
             IpAddr::V4(d) => RouteMessageBuilder::<Ipv4Addr>::new()
                 .destination_prefix(d, plen)
                 .table_id(table)
+                .scope(RouteScope::NoWhere)
+                .protocol(RouteProtocol::Unspec)
                 .build(),
             IpAddr::V6(d) => RouteMessageBuilder::<Ipv6Addr>::new()
                 .destination_prefix(d, plen)
                 .table_id(table)
+                .scope(RouteScope::NoWhere)
+                .protocol(RouteProtocol::Unspec)
                 .build(),
         };
         match self.handle.route().del(msg).execute().await {
