@@ -710,6 +710,7 @@ fn guard_arp_discover(fwd0: u32) -> Vec<Vec<u8>> {
     e.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, ARP_OP, 2, NFT_REG_1));
     e.push(cmp(NFT_REG_1, NFT_CMP_EQ, &1u16.to_be_bytes())); // request
     e.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, ARP_SPA, 4, NFT_REG_1));
+    e.push(cmp(NFT_REG_1, NFT_CMP_NEQ, &[0u8; 4])); // not an ACD probe (spa != 0.0.0.0); v4 analog of NS's src != :: DAD guard. Else the guest's own RFC 5227 probe is cloned back over the bridge and read as a conflict -> the guest declines every offer.
     e.push(lookup_inv("ip2mac4", SID_IP2MAC4, NFT_REG_1)); // sender IP not a learned guest
     e.extend(term_dup(fwd0));
     e

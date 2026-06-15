@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from common import (
-    GW4, GW6, HANDOVER_4, HANDOVER_6, MAGIC, NEIGH1_4, NEIGH2_4,
+    GW4, GW6, HANDOVER_4, HANDOVER_6, HOST4, HOST6, MAGIC, NEIGH1_4, NEIGH2_4,
     VM1_4, VM1_6, VM2_4, VM2_6, VM3_4, VM3_6,
     Fail, expect, expect_no_ping, expect_ping, leak_count, ping, sh, sh_ok, until_ok,
 )
@@ -137,6 +137,68 @@ def neigh_coexist(c: Ctx):
 
 # ---------------------------------------------------------------- silent VM / DHCP
 
+# Raw-socket helper (run inside the guest netns): fire one RFC 5227 ACD probe and report
+# whether it gets echoed back. Self-contained (no scapy/arping) so it runs under the
+# Alpine GKI guest too. Written to the unit-private /tmp at case time, like dhcp_v4.
+_ARP_PROBE_PY = r'''
+import socket, struct, sys, time, fcntl
+iface, target, window = sys.argv[1], sys.argv[2], float(sys.argv[3])
+ETH_P_ALL, ETH_P_ARP = 0x0003, 0x0806
+PKT_OUTGOING = getattr(socket, "PACKET_OUTGOING", 4)
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+s.bind((iface, 0))
+my_mac = fcntl.ioctl(s.fileno(), 0x8927, struct.pack("256s", iface.encode()))[18:24]
+tpa = socket.inet_aton(target)
+# ACD probe: broadcast ARP request, sender proto addr = 0.0.0.0, target = `target`.
+arp = (struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1) + my_mac + b"\x00\x00\x00\x00"
+       + b"\x00" * 6 + tpa)
+s.send(b"\xff" * 6 + my_mac + struct.pack("!H", ETH_P_ARP) + arp)
+# Sniff for the same probe coming back: an INBOUND arp frame whose ARP *target* addr is
+# `target` and whose ethernet src is not ours (the discovery dup floods it back after
+# pbridge normalised src->HOSTMAC). Frame offsets: eth src 6:12, ethertype 12:14; the arp
+# body starts at 14, so its target-proto-addr (arp offset 24) sits at frame 38:42.
+s.settimeout(0.3)
+deadline, verdict = time.monotonic() + window, "CLEAN"
+while time.monotonic() < deadline:
+    try:
+        pkt, addr = s.recvfrom(2048)
+    except socket.timeout:
+        continue
+    if addr[2] == PKT_OUTGOING or len(pkt) < 42:
+        continue  # skip our own transmit; only inbound copies count
+    if pkt[12:14] == struct.pack("!H", ETH_P_ARP) and pkt[38:42] == tpa and pkt[6:12] != my_mac:
+        verdict = "REFLECTED"
+        break
+print(verdict)
+'''
+
+
+@case(requires=lambda c: c.mode != "direct",
+      desc="guest ACD probe (spa=0) is not echoed back to the prober (discovery-dup regression)")
+def arp_probe_no_reflect(c: Ctx):
+    # The fwd-mode discovery dup clones a host-originated ARP-request for an unlearned
+    # target down to the bridge so a silent VM gets discovered. An RFC 5227 ACD probe has
+    # spa=0.0.0.0, which is never in ip2mac, so without the spa!=0 guard the clone floods
+    # the guest's OWN probe back to it — the guest reads it as a conflict and declines every
+    # DHCP offer (dhcpcd walks the whole pool). The probe must still go upstream; only the
+    # echo back to the prober is the bug. In this topology the discovery dup is the sole path
+    # that can return the probe to its sender, so a reflection here is exactly that bug.
+    TARGET = "10.0.0.222"  # unused: nothing answers it, so the only ARP about it seen on vm3
+                           # is our own probe (outbound, filtered) or its reflection (inbound).
+    Path("/tmp/arp_probe.py").write_text(_ARP_PROBE_PY)
+    sh("ip", "-n", "vm3", "link", "set", "eth0", "address", "02:00:00:00:0c:03")  # != HOSTMAC
+    sh("ip", "-n", "vm3", "link", "set", "eth0", "up")
+    try:
+        r = sh("python3", "/tmp/arp_probe.py", "eth0", TARGET, "2.5", ns="vm3")
+        expect(r.returncode == 0, f"arp-probe helper errored: {r.stderr.strip() or r.stdout.strip()}")
+        expect(r.stdout.strip() == "CLEAN",
+               f"guest ACD probe was reflected back to the prober ({r.stdout.strip()!r}): "
+               "discovery dup is echoing spa=0 probes")
+    finally:  # restore the silent/unaddressed vm3 the cases below expect
+        sh("ip", "-n", "vm3", "addr", "flush", "dev", "eth0")
+        sh("ip", "-n", "vm3", "link", "set", "eth0", "down")
+
+
 @case(requires=lambda c: c.mode != "direct",
       desc="phone -> silent VM: discovery dup learns it, vmroute appears (fwd)")
 def silent_vm(c: Ctx):
@@ -188,6 +250,57 @@ def dhcp_v4(c: Ctx):
     finally:
         dns.kill()
         dns.wait()
+
+
+# End-to-end of the probe-reflection bug with the real client that triggers it. dhcpcd
+# does RFC 5227 ARP ACD on the offered address (udhcpc in dhcp_v4 does NOT, which is why
+# that case can't see this bug). Under the bug the discovery dup echoes dhcpcd's own probe
+# back, dhcpcd reads it as a conflict, DECLINEs, and walks the pool without ever binding —
+# the oneshot times out. With the fix ACD passes and it binds on the first offer.
+@case(requires=lambda c: c.mode != "direct" and shutil.which("dnsmasq") and shutil.which("dhcpcd"),
+      desc="dhcpcd e2e: RFC 5227 ACD passes (probe not reflected) -> binds, no DECLINE loop")
+def dhcp_dhcpcd_acd(c: Ctx):
+    # dhcpcd's run/db dirs (/run/dhcpcd, /var/lib/dhcpcd) are shared across parallel units
+    # (only /tmp + /run/netns are private tmpfs), and its privsep socket / DUID would collide.
+    # We're already in the unit's mount ns, so a private tmpfs over each is unit-local and
+    # torn down with the ns. Hermetic minimal config so host /etc/dhcpcd.conf can't disable
+    # ARP (ACD must stay on — it's the whole point).
+    for d in ("/run/dhcpcd", "/var/lib/dhcpcd"):
+        sh("mount", "-t", "tmpfs", "tmpfs", d)
+    Path("/tmp/dhcpcd-acd.conf").write_text("# pbridge test: defaults, ARP ACD stays on\n")
+    sh("ip", "-n", "vm3", "addr", "flush", "dev", "eth0")
+    sh("ip", "-n", "vm3", "link", "set", "eth0", "up")
+    dns = subprocess.Popen(
+        ["ip", "netns", "exec", "gw", "dnsmasq", "--no-daemon", "--interface=wanbr",
+         "--bind-interfaces", "--port=0", "--no-ping", "--dhcp-authoritative",
+         "--dhcp-leasefile=/tmp/dnsmasq-dhcpcd.leases",
+         "--dhcp-range=10.0.0.100,10.0.0.150,255.255.255.0,12h"],
+        stdout=open("/tmp/dnsmasq-dhcpcd.log", "w"), stderr=subprocess.STDOUT)
+    try:
+        time.sleep(1.5)  # let dnsmasq bind before soliciting
+        # -1 oneshot (exit on bind or timeout), -4 v4-only. No -A: ARP ACD stays on. The
+        # timeout is the assertion — under the bug dhcpcd never binds (every probe reflected).
+        r = sh("dhcpcd", "-1", "-4", "-t", "15", "-f", "/tmp/dhcpcd-acd.conf",
+               "-j", "/tmp/dhcpcd-acd.log", "eth0", ns="vm3")
+        toks = sh("ip", "-n", "vm3", "-4", "-br", "addr", "show", "eth0").stdout.split()
+        ip = next((t.split("/")[0] for t in toks if t.startswith("10.0.0.")), "")
+        bound = ip and 100 <= int(ip.rsplit(".", 1)[1]) <= 150
+        if not (r.returncode == 0 and bound):
+            try:
+                tail = "\n".join(Path("/tmp/dhcpcd-acd.log").read_text().splitlines()[-6:])
+            except OSError:
+                tail = "(no dhcpcd log)"
+            raise Fail(f"dhcpcd never bound (rc={r.returncode}, addr={ip or 'none'}) — ACD "
+                       f"probe reflected -> DECLINE loop. dhcpcd log:\n{tail}")
+        expect_ping("vm3", GW4, f"dhcpcd-leased {ip} pings gw", budget=10, src=ip)
+    finally:
+        sh("dhcpcd", "-x", "eth0", ns="vm3")  # stop/release any lingering process
+        sh("ip", "-n", "vm3", "addr", "flush", "dev", "eth0")
+        sh("ip", "-n", "vm3", "link", "set", "eth0", "down")
+        dns.kill()
+        dns.wait()
+        for d in ("/var/lib/dhcpcd", "/run/dhcpcd"):
+            sh("umount", "-l", d)
 
 
 # ---------------------------------------------------------------- mutations
@@ -408,6 +521,105 @@ def ip_handover(c: Ctx):
     finally:
         sh("ip", "-n", "neigh1", "addr", "del", f"{X4}/24", "dev", "eth0")
         sh("ip", "-n", "neigh1", "addr", "del", f"{X6}/64", "dev", "eth0")
+
+
+# ----------------------------------------- full DHCP + connectivity matrix (last)
+
+def _node_dhcpcd(ns: str, budget: int = 25) -> bool:
+    """Lease v4 (DHCP) + v6 (SLAAC/RA) on `ns`:eth0 via real dhcpcd. Each runs in its own
+    mount ns so its DUID (/var/lib/dhcpcd) and control socket (/run/dhcpcd) are private —
+    a unique client-id per node (else the MAC-NAT, which rewrites the ethernet src to one
+    HOSTMAC, would let a shared DUID collapse the VMs to one lease) and no socket collision.
+    The address is applied in the net ns and survives the oneshot exit; the ephemeral mount
+    ns is torn down with dhcpcd. ARP ACD stays on (the bug this all started from)."""
+    r = sh("unshare", "--mount", "sh", "-c",
+           "mount -t tmpfs none /var/lib/dhcpcd && mount -t tmpfs none /run/dhcpcd && "
+           f"exec dhcpcd -1 --waitip 4 --waitip 6 -t {budget} "
+           f"-f /tmp/dhcpcd-net.conf -j /tmp/dhcpcd-{ns}.log eth0", ns=ns)
+    return r.returncode == 0
+
+
+def _lease4(ns: str) -> str:
+    toks = sh("ip", "-n", ns, "-4", "-br", "addr", "show", "eth0").stdout.split()
+    return next((t.split("/")[0] for t in toks if t.startswith("10.0.0.")), "")
+
+
+def _lease6(ns: str) -> str:
+    out = sh("ip", "-n", ns, "-6", "addr", "show", "dev", "eth0", "scope", "global").stdout
+    return next((l.split()[1].split("/")[0] for l in out.splitlines()
+                 if l.strip().startswith("inet6 fd00:")), "")
+
+
+# Runs last (before the leak guard): it converts the persistent static nodes into DHCP
+# clients, which is destructive to their fixed IPs — fine here since only leak_guard (IP-
+# agnostic) follows and the unit tears the namespaces down afterwards.
+@case(requires=lambda c: c.mode != "direct" and shutil.which("dnsmasq") and shutil.which("dhcpcd"),
+      desc="full matrix: vm1/vm2/neigh1/neigh2 all lease v4(DHCP)+v6(SLAAC); neigh->host & "
+           "host->vm in every sim; neigh->vm gated by the offload-workaround")
+def dhcp_full_matrix(c: Ctx):
+    nodes = ("vm1", "vm2", "neigh1", "neigh2")
+    # Restart pbridge to its DEFAULT flags. This case runs late, and on the qcom unit the
+    # earlier arp_keepalive_hold leaves pbridge running with --arp-keepalive, which keeps the
+    # wan neighbours' caches warm for every learned guest v4 — that would make the "neigh->vm
+    # v4 blocked under qcom" assertion below spuriously reachable. The per-sim predicates
+    # (v4_actively_resolvable etc.) are defined for the default config, so pin it here.
+    expect(c.pb.restart(), "pbridge restarts with default flags")
+    Path("/tmp/dhcpcd-net.conf").write_text("# pbridge test: defaults (ARP ACD on, v6 SLAAC)\n")
+    for n in nodes:
+        sh("ip", "-n", n, "addr", "flush", "dev", "eth0")
+        sh("ip", "-n", n, "link", "set", "eth0", "up")
+    dns = subprocess.Popen(
+        ["ip", "netns", "exec", "gw", "dnsmasq", "--no-daemon", "--interface=wanbr",
+         "--bind-interfaces", "--port=0", "--no-ping", "--dhcp-authoritative",
+         "--enable-ra", "--dhcp-range=fd00::,ra-only",  # v6 = SLAAC from RA (no DHCPv6)
+         "--dhcp-leasefile=/tmp/dnsmasq-net.leases",
+         "--dhcp-range=10.0.0.100,10.0.0.150,255.255.255.0,12h"],
+        stdout=open("/tmp/dnsmasq-net.log", "w"), stderr=subprocess.STDOUT)
+    try:
+        time.sleep(1.5)  # let dnsmasq bind + start RAs before soliciting
+        # 1) every node leases v4 (DHCP — via the broadcast-flag path through the MAC-NAT for
+        #    the VMs) and v6 (SLAAC from the gw's RA, which reaches the VMs via the mcast dup).
+        v4, v6 = {}, {}
+        for n in nodes:
+            expect(_node_dhcpcd(n), f"{n}: dhcpcd failed to lease v4+v6 (see /tmp/dhcpcd-{n}.log)")
+            v4[n], v6[n] = _lease4(n), _lease6(n)
+            expect(v4[n] and v6[n], f"{n}: incomplete lease (v4={v4[n]!r} v6={v6[n]!r})")
+        expect(len(set(v4.values())) == len(nodes),
+               f"v4 leases collided — MAC-NAT collapsed clients to one id? {v4}")
+
+        # 2) neigh -> host (phone): host_ips are early-accepted, works in every sim. v4+v6.
+        for n in ("neigh1", "neigh2"):
+            expect_ping(n, HOST4, f"{n} -> host v4", src=v4[n])
+            expect_ping(n, HOST6, f"{n} -> host v6", src=v6[n])
+
+        # 3) host -> vm: vmroute + discovery dup, works in every sim. v4+v6.
+        for vm in ("vm1", "vm2"):
+            expect_ping("phone", v4[vm], f"host -> {vm} v4")
+            expect_ping("phone", v6[vm], f"host -> {vm} v6")
+
+        # 4) neigh -> vm: THE offload-workaround direction — a wan neighbour resolving a guest
+        #    through the MAC-NAT. portsec passes (inbound floods to the vm, which replies);
+        #    apf/qcom drop that resolution unless fwd-with-offload installs the proxy (= the
+        #    workaround), and qcom's single v4 slot still can't take the v4 proxy. So:
+        #      v4 reachable iff portsec or (apf & offloaded)  [== v4_actively_resolvable]
+        #      v6 reachable iff portsec or offloaded
+        v4ok = v4_actively_resolvable(c)
+        v6ok = c.sim == "portsec" or offloaded(c)
+        for n, vm in (("neigh1", "vm1"), ("neigh2", "vm2")):
+            if v4ok:
+                expect_ping(n, v4[vm], f"{n} -> {vm} v4 (portsec/workaround)", src=v4[n])
+            else:
+                expect_no_ping(n, v4[vm], f"{n} -> {vm} v4 blocked without workaround", src=v4[n])
+            if v6ok:
+                expect_ping(n, v6[vm], f"{n} -> {vm} v6 (portsec/workaround)", src=v6[n])
+            else:
+                expect_no_ping(n, v6[vm], f"{n} -> {vm} v6 blocked without workaround", src=v6[n])
+    finally:
+        dns.kill()
+        dns.wait()
+        for n in nodes:
+            sh("dhcpcd", "-x", "eth0", ns=n)
+            sh("ip", "-n", n, "addr", "flush", "dev", "eth0")
 
 
 # ---------------------------------------------------------------- final guard

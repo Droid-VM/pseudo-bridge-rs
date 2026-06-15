@@ -35,7 +35,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang nftables iproute2 tcpdump dnsmasq busybox-static \
-                                  libseccomp-dev util-linux
+                                  libseccomp-dev util-linux dhcpcd-base
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
       - name: Add musl target (upsim + x64 static)

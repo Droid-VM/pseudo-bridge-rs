@@ -239,10 +239,15 @@ ebpf 速記:`store(off,v)`=`bpf_skb_store_bytes`、`redirect(d)`=`bpf_redirect(d
 
         if (ARP request 或 NS) and srcip ∉ ip2mac(host 發起,非已學 guest):
             clone_redirect(skb, fwd0)            # **clone 不 redirect**:原包仍出 up0 → gateway 照樣解析得到
-        # NS 額外 guard:src ≠ ::(不 clone DAD);srcip ∉ ip2mac 用 ebpf map lookup / nft lookup_inv 反向成員測試
+        # 額外 guard:ARP 要 spa ≠ 0.0.0.0、NS 要 src ≠ ::(都不 clone 位址探測 —— RFC 5227 ARP ACD probe / DAD NS:
+        #            探測者用 0/:: 當 src,永遠不在 ip2mac,不擋的話會把 guest 自己的探測 clone 回 vmbr → 探測者收到 →
+        #            誤判衝突 → 凡做 ACD 的 client(如 dhcpcd)拒絕每個 offer、無限換 IP)。srcip ∉ ip2mac 用 ebpf map lookup / nft lookup_inv 反向成員測試
 
   - 流程:host ARP/NS G(出 up0)→ clone 到 fwd0→fwd1→vmbr→VM → VM 回 ARP-reply/NA(進 fwd0 ingress = OUT)→ **learn G→vmmac**、建 vmroute G/128→br → host **重試**(ping/TCP re-tx)時 /32·/128 比 up0 的連線 prefix 更specific → 改在 br 上解析 → 連上。原查詢那次因回應沒進 host stack 會逾時,靠重試成立(延遲約一個 retry)。
-  - 只 clone **host 發起**(srcip 非 guest)的用意是**去重,不是防迴圈**:迴圈本來就不會發生(bridge hairpin off,注入 fwd0 egress→fwd1 ingress 不會再被 flood 回 fwd1)。但若不檢查,guest 自己廣播的 ARP/NS(被 redirect 到 up0)會被 clone 回 vmbr → 其他 VM 收到兩份(VM 多時廣播翻倍)。故 srcip 已在 ip2mac → 不 clone。
+  - 兩道 guard 互補,各擋一種「不該 clone 的 out 廣播」:
+    - `srcip ∈ ip2mac`(已學 guest 的廣播 ARP/NS):純**去重** —— 不擋只是其他 VM 多收一份(VM 多時翻倍),**非正確性問題**。
+    - `spa ≠ 0.0.0.0` / `src ≠ ::`(guest 自己的位址探測:ARP ACD probe / DAD NS):探測者 src = 0/::,**永不在 ip2mac**,上一道擋不到 → 必須獨立判,否則**會壞**(非只是多一份)。
+  - 為何 probe 反射會「壞」而非只是多一份:clone 注入 fwd0→fwd1 進 vmbr 後 flood 到**所有** vmbr port。「hairpin off、不回灌 fwd1」只擋**同 port 回流**,擋不掉 flood 到**其他** port —— 含**探測者自己的 tap**(它從 fwd1 進來、與探測者 tap 不同 port,bridge 照送)→ 探測者收到自己的探測(src 已被 OUT 正規化成 HOSTMAC)→ 誤判位址被別人占用 → 凡做 ACD 的 client(如 dhcpcd)拒絕每個 offer、無限換 IP。⇒ probe 只能靠 src 值(0/::)擋,埠別擋不到。回歸:`arp_probe_no_reflect`(注入探測、斷言不反射)、`dhcp_dhcpcd_acd`(端到端 dhcpcd 必須綁定)。
   - 成本可忽略:`lookup`(ebpf map / nft `lookup_inv` 反向成員測試)**只在 ARP-request / NS 上做**(被 ethertype / icmp-type 前置條件擋著),資料快路徑(TCP/UDP、甚至 ICMPv6 echo/NA)完全不碰。host 與 guest-forwarded 出向 src mac 都已是 HOSTMAC,唯一能分辨的就是 src IP,故這個 lookup 無可省。
   - direct mode 不需要(VM 與 host 同在 br0,host 直接在 br0 上解析)。
 

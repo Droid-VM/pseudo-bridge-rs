@@ -312,7 +312,10 @@ int egress_guard(struct __sk_buff *skb) {
         if (op == hs(1)) { // request
             __u32 spa = 0;
             bpf_skb_load_bytes(skb, O_ARP_SPA, &spa, 4);
-            if (!bpf_map_lookup_elem(&ip2mac4, &spa))
+            // spa != 0: skip RFC 5227 ACD probes (v4 analog of the NS src != :: DAD guard
+            // below). Else the guest's own probe is cloned back over the bridge and read as a
+            // conflict, so the guest declines every DHCP offer.
+            if (spa != 0 && !bpf_map_lookup_elem(&ip2mac4, &spa))
                 bpf_clone_redirect(skb, c->fwd0_ifx, 0);
         }
     } else if (proto == hs(ETH_P_IPV6)) {
