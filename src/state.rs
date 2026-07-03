@@ -10,11 +10,17 @@ use crate::cli::MaxCap;
 use crate::types::{family, Family, Mac};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::time::Instant;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub mac: Mac,
     pub createat: u64,
+    /// When this ip last produced a control-plane copy (ARP/ND learn event, including
+    /// no-op re-learns). The offload keepalive probe consults it: a guest whose DAD NS
+    /// just arrived is mid-DAD, and probing it with our DAD-form NS within that window
+    /// reads as an address conflict (RFC 4862) — the guest would abort the address.
+    pub last_ctrl: Instant,
 }
 
 pub struct Entries {
@@ -103,6 +109,7 @@ impl Entries {
     pub fn learn(&mut self, ip: IpAddr, mac: Mac) -> LearnResult {
         let mut res = LearnResult::default();
         if let Some(e) = self.map.get_mut(&ip) {
+            e.last_ctrl = Instant::now(); // control-plane activity even when a no-op
             if e.mac == mac {
                 return res; // known, no-op (liveness handled by kernel seen)
             }
@@ -124,7 +131,7 @@ impl Entries {
             }
         }
         let createat = self.next_seq();
-        self.map.insert(ip, Entry { mac, createat });
+        self.map.insert(ip, Entry { mac, createat, last_ctrl: Instant::now() });
         res.changed.push(ip);
         res
     }

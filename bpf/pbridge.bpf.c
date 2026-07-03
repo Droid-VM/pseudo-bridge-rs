@@ -225,8 +225,17 @@ static __always_inline int out_common(struct __sk_buff *skb, int is_direct) {
 static __always_inline int in_common(struct __sk_buff *skb, int is_direct) {
     struct cfg *c = getcfg();
     if (!c) return TC_ACT_OK;
-    __u8 dst[6];
+    __u8 dst[6], src[6];
     if (bpf_skb_load_bytes(skb, O_ETH_DST, dst, 6) < 0) return TC_ACT_OK;
+    if (bpf_skb_load_bytes(skb, O_ETH_SRC, src, 6) < 0) return TC_ACT_OK;
+    // Reflected self-frame guard: a Wi-Fi AP echoes a STA's own transmissions back
+    // down (broadcasts at the next DTIM, unicast-to-own-mac via hairpin), so frames
+    // with src == HOSTMAC can and do arrive on up0 ingress. They are always copies of
+    // something we sent; processing them is poison — a reflected GARP/keepalive would
+    // be dup'd into the guest bridge and repoint the host's own neighbour entry for a
+    // guest to HOSTMAC (host->guest then dies on the OUT src-drop), and a hairpinned
+    // ARP reply would be demuxed back to a guest, teaching it host-ip -> HOSTMAC.
+    if (mac_eq(src, c->hostmac)) return TC_ACT_SHOT;
     int dst_is_host = mac_eq(dst, c->hostmac);
     __u32 fwd0 = c->fwd0_ifx;
     __u16 proto;
@@ -304,31 +313,72 @@ int egress_guard(struct __sk_buff *skb) {
     // still goes upstream so the gateway is still resolved. Only host-originated: if the
     // source IP is already a learned guest (in ip2mac), it's guest ARP/NS that was redirected
     // here, so we don't echo it back.
+    //
+    // The clone is made ADDRESS-ANONYMOUS before it enters the guest bridge (ARP: spa=0,
+    // the RFC 5227 probe form; NS: src=:: + SLLAO neutralized, the DAD form) and the
+    // original is restored right after (clone_redirect snapshots the current skb). A clone
+    // carrying "host-ip @ HOSTMAC" teaches every guest that mapping — correct on the wire
+    // but wrong on the bridge segment (there the host is the bridge's mac), so a guest
+    // would send all host-bound traffic out the uplink instead. Guests still answer the
+    // anonymous probe (defend/DAD reply), the reply is addressed to sha/L2 = HOSTMAC, so
+    // it crosses fwd0 and gets learned exactly as before. Only broadcast (ARP) /
+    // solicited-node multicast (NS) solicitations are cloned — a unicast NUD probe cannot
+    // discover a silent guest, and the kernel falls back to multicast resolution anyway.
     __u16 proto;
     if (bpf_skb_load_bytes(skb, O_ETHTYPE, &proto, 2) < 0) return TC_ACT_OK;
+    __u8 dst[6];
+    if (bpf_skb_load_bytes(skb, O_ETH_DST, dst, 6) < 0) return TC_ACT_OK;
     if (proto == hs(ETH_P_ARP)) {
+        __u8 bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
         __u16 op = 0;
         bpf_skb_load_bytes(skb, O_ARP_OP, &op, 2);
-        if (op == hs(1)) { // request
+        if (op == hs(1) && mac_eq(dst, bcast)) { // broadcast request
             __u32 spa = 0;
             bpf_skb_load_bytes(skb, O_ARP_SPA, &spa, 4);
             // spa != 0: skip RFC 5227 ACD probes (v4 analog of the NS src != :: DAD guard
             // below). Else the guest's own probe is cloned back over the bridge and read as a
             // conflict, so the guest declines every DHCP offer.
-            if (spa != 0 && !bpf_map_lookup_elem(&ip2mac4, &spa))
+            if (spa != 0 && !bpf_map_lookup_elem(&ip2mac4, &spa)) {
+                __u32 zero = 0;
+                bpf_skb_store_bytes(skb, O_ARP_SPA, &zero, 4, 0); // ACD-ize (no ARP csum)
                 bpf_clone_redirect(skb, c->fwd0_ifx, 0);
+                bpf_skb_store_bytes(skb, O_ARP_SPA, &spa, 4, 0); // restore for the wire
+            }
         }
     } else if (proto == hs(ETH_P_IPV6)) {
         __u8 nh = 0;
         bpf_skb_load_bytes(skb, O_V6_NH, &nh, 1);
-        if (nh == 58) {
+        // dst 33:33:* = IPv6 multicast mac (solicited-node resolution NS)
+        if (nh == 58 && dst[0] == 0x33 && dst[1] == 0x33) {
             __u8 t = 0;
             bpf_skb_load_bytes(skb, O_ICMP6, &t, 1);
             if (t == 135) { // NS
                 struct in6 s6;
+                __u8 o4[4]; // first ND option: type, len, mac[0..2]
                 bpf_skb_load_bytes(skb, O_V6_SRC, &s6, 16);
-                if (!is_unspec16(&s6) && !bpf_map_lookup_elem(&ip2mac6, &s6))
+                if (!is_unspec16(&s6) && !bpf_map_lookup_elem(&ip2mac6, &s6) &&
+                    bpf_skb_load_bytes(skb, O_NSNA_OPT, o4, 4) == 0 && o4[0] == 1) {
+                    // DAD-ize the clone: src -> ::, SLLAO type -> unassigned(200) so
+                    // receivers ignore it (a DAD NS must carry no SLLAO; RFC 4861 §7.1.1
+                    // only rejects a *recognized* source-lladdr option, unknown options
+                    // are skipped). Both edits are ICMPv6-csum-covered (src via the
+                    // pseudo-header) — incremental fix, then undo everything post-clone.
+                    struct in6 zero6 = {};
+                    __u8 n4[4] = {200, o4[1], o4[2], o4[3]};
+                    __s64 dsrc = bpf_csum_diff((__be32 *)s6.a, 16, (__be32 *)zero6.a, 16, 0);
+                    __s64 dopt = bpf_csum_diff((__be32 *)o4, 4, (__be32 *)n4, 4, 0);
+                    bpf_l4_csum_replace(skb, O_ICMP6_CSUM, 0, dsrc, 0);
+                    bpf_l4_csum_replace(skb, O_ICMP6_CSUM, 0, dopt, 0);
+                    bpf_skb_store_bytes(skb, O_V6_SRC, zero6.a, 16, 0);
+                    bpf_skb_store_bytes(skb, O_NSNA_OPT, n4, 1, 0);
                     bpf_clone_redirect(skb, c->fwd0_ifx, 0);
+                    __s64 rsrc = bpf_csum_diff((__be32 *)zero6.a, 16, (__be32 *)s6.a, 16, 0);
+                    __s64 ropt = bpf_csum_diff((__be32 *)n4, 4, (__be32 *)o4, 4, 0);
+                    bpf_l4_csum_replace(skb, O_ICMP6_CSUM, 0, rsrc, 0);
+                    bpf_l4_csum_replace(skb, O_ICMP6_CSUM, 0, ropt, 0);
+                    bpf_skb_store_bytes(skb, O_V6_SRC, s6.a, 16, 0);
+                    bpf_skb_store_bytes(skb, O_NSNA_OPT, o4, 1, 0);
+                }
             }
         }
     }

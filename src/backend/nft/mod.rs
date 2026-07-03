@@ -55,6 +55,11 @@ const TH_RS_OPT: u32 = 8;
 const TH_RS_LLA: u32 = 10;
 const TH_BOOTP_FLAGS: u32 = 18;
 const TH_UDP_CSUM: u32 = 6;
+const TH_ICMP_CSUM: u32 = 2; // ICMPv6 checksum, transport-relative
+// ICMPv6 checksum as a NETWORK-header-relative offset (fixed 40B IPv6 header + 2;
+// host-generated NS never carries extension headers). Used when a payload_set on the
+// IPv6 header itself (pseudo-header field) must incrementally fix the ICMPv6 csum.
+const V6_ICMP_CSUM_FROM_NET: u32 = 42;
 
 const ETH_IP4: u16 = 0x0800;
 const ETH_IP6: u16 = 0x86dd;
@@ -670,7 +675,14 @@ fn in_demux_arp(hostmac: Mac, term: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
 }
 
 fn in_rules_fwd(hostmac: Mac, fwd0: u32) -> Vec<Vec<Vec<u8>>> {
-    let mut rules = in_host_rules(hostmac);
+    // Reflected self-frame guard FIRST: a Wi-Fi AP echoes the STA's own transmissions
+    // back down (broadcasts at the next DTIM, unicast-to-own-mac via hairpin). Anything
+    // arriving with src == HOSTMAC is such a copy; the bcast/mcast dup below would
+    // re-inject it into the guest bridge (a reflected keepalive GARP then repoints the
+    // host's own neighbour entry for a guest to HOSTMAC → host->guest black-hole), and
+    // the demux would hand hairpinned replies back to guests. Drop them outright.
+    let mut rules = vec![drop_src(hostmac)];
+    rules.extend(in_host_rules(hostmac));
     // bcast/mcast dup
     rules.push({
         let mut r = vec![meta_load(NFT_META_PKTTYPE_KEY, NFT_REG_1), cmp(NFT_REG_1, NFT_CMP_EQ, &[PKT_BROADCAST])];
@@ -695,37 +707,76 @@ fn in_rules_fwd(hostmac: Mac, fwd0: u32) -> Vec<Vec<Vec<u8>>> {
 }
 
 fn in_rules_direct(hostmac: Mac) -> Vec<Vec<Vec<u8>>> {
-    let mut rules = in_host_rules(hostmac);
+    // same reflected self-frame guard as fwd (see in_rules_fwd) — in direct mode the
+    // echoed copy would otherwise be flooded by the kernel bridge into the guest ports.
+    let mut rules = vec![drop_src(hostmac)];
+    rules.extend(in_host_rules(hostmac));
     rules.push(in_demux_ip(Family::V4, hostmac, term_accept()));
     rules.push(in_demux_ip(Family::V6, hostmac, term_accept()));
     rules.push(in_demux_arp(hostmac, term_accept()));
     rules
 }
 
-/// fwd-only discovery: clone a host-originated ARP-request whose sender IP isn't a learned
-/// guest (i.e. host→unknown) to fwd0, so a silent guest replies and gets learned. Clone, not
-/// redirect — the original still goes upstream (the gateway is still resolved).
+/// fwd-only discovery: clone a host-originated broadcast ARP-request whose sender IP isn't
+/// a learned guest (i.e. host→unknown) to fwd0, so a silent guest replies and gets learned.
+/// Clone, not redirect — the original still goes upstream (the gateway is still resolved).
+///
+/// The CLONE is ACD-ized first (spa=0.0.0.0, restored right after — `dup` snapshots the
+/// packet's current state): it is delivered inside the guest bridge, where the host's L2
+/// identity is the bridge mac, so a clone carrying "host-ip @ HOSTMAC" would repoint every
+/// guest's neighbour entry for the host and their host-bound replies would detour out the
+/// uplink. spa=0 gives receivers nothing to cache; the silent guest still defends (RFC
+/// 5227) toward sha=HOSTMAC → its reply crosses fwd0 and is learned as before. Broadcast
+/// requests only: a unicast NUD probe can't discover a silent guest anyway, and the kernel
+/// falls back to broadcast resolution itself.
 fn guard_arp_discover(fwd0: u32) -> Vec<Vec<u8>> {
     let mut e = eth_gate(ETH_ARP);
+    e.push(payload_load(NFT_PAYLOAD_LL_HEADER, LL_DST, 6, NFT_REG_1));
+    e.push(cmp(NFT_REG_1, NFT_CMP_EQ, &[0xffu8; 6])); // broadcast resolution only
     e.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, ARP_OP, 2, NFT_REG_1));
     e.push(cmp(NFT_REG_1, NFT_CMP_EQ, &1u16.to_be_bytes())); // request
-    e.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, ARP_SPA, 4, NFT_REG_1));
-    e.push(cmp(NFT_REG_1, NFT_CMP_NEQ, &[0u8; 4])); // not an ACD probe (spa != 0.0.0.0); v4 analog of NS's src != :: DAD guard. Else the guest's own RFC 5227 probe is cloned back over the bridge and read as a conflict -> the guest declines every offer.
-    e.push(lookup_inv("ip2mac4", SID_IP2MAC4, NFT_REG_1)); // sender IP not a learned guest
+    // sender IP into REG_3: it must survive the immediate/dup below (both use REG_1)
+    // so the original spa can be restored for the wire copy.
+    e.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, ARP_SPA, 4, NFT_REG_3));
+    e.push(cmp(NFT_REG_3, NFT_CMP_NEQ, &[0u8; 4])); // not an ACD probe (spa != 0.0.0.0); v4 analog of NS's src != :: DAD guard. Else the guest's own RFC 5227 probe is cloned back over the bridge and read as a conflict -> the guest declines every offer.
+    e.push(lookup_inv("ip2mac4", SID_IP2MAC4, NFT_REG_3)); // sender IP not a learned guest
+    // ACD-ize → dup → restore (ARP has no checksum)
+    e.push(immediate_data(NFT_REG_1, &[0u8; 4]));
+    e.push(payload_set(NFT_PAYLOAD_NETWORK_HEADER, ARP_SPA, 4, NFT_REG_1, None));
     e.extend(term_dup(fwd0));
+    e.push(payload_set(NFT_PAYLOAD_NETWORK_HEADER, ARP_SPA, 4, NFT_REG_3, None));
     e
 }
 
-/// fwd-only discovery: same as `guard_arp_discover` but for a host-originated NS.
+/// fwd-only discovery: same as `guard_arp_discover` but for a host-originated NS — the
+/// clone is DAD-ized (src=::, SLLAO type neutralized to unassigned 200 so receivers skip
+/// it; a DAD NS must carry no *recognized* source-lladdr option) and restored after the
+/// dup. Both edits are ICMPv6-checksum-covered (the source via the pseudo-header), fixed
+/// incrementally by payload_set's inet-csum support. The defending guest answers a DAD NS
+/// with an NA to ff02::1 (all-nodes), which floods across fwd0 and is learned as before.
+/// Solicited-node multicast only (dst mac 33:33:*): unicast NUD probes are not cloned.
 fn guard_ns_discover(fwd0: u32) -> Vec<Vec<u8>> {
     let mut e = eth_gate(ETH_IP6);
     e.extend(l4_gate(L4_ICMPV6));
+    e.push(payload_load(NFT_PAYLOAD_LL_HEADER, LL_DST, 2, NFT_REG_1));
+    e.push(cmp(NFT_REG_1, NFT_CMP_EQ, &[0x33u8, 0x33])); // v6 multicast mac (solicited-node)
     e.push(payload_load(NFT_PAYLOAD_TRANSPORT_HEADER, TH_ICMP_TYPE, 1, NFT_REG_1));
     e.push(cmp(NFT_REG_1, NFT_CMP_EQ, &[135])); // NS
-    e.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, V6_SADDR, 16, NFT_REG_1));
-    e.push(cmp(NFT_REG_1, NFT_CMP_NEQ, &[0u8; 16])); // not DAD (src != ::)
-    e.push(lookup_inv("ip2mac6", SID_IP2MAC6, NFT_REG_1)); // source not a learned guest
+    e.push(payload_load(NFT_PAYLOAD_TRANSPORT_HEADER, TH_NSNA_OPT, 1, NFT_REG_1));
+    e.push(cmp(NFT_REG_1, NFT_CMP_EQ, &[1])); // first option is an SLLAO (host NS always has one)
+    // source into REG_3 (survives the immediates/dup; used for match + restore)
+    e.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, V6_SADDR, 16, NFT_REG_3));
+    e.push(cmp(NFT_REG_3, NFT_CMP_NEQ, &[0u8; 16])); // not DAD (src != ::)
+    e.push(lookup_inv("ip2mac6", SID_IP2MAC6, NFT_REG_3)); // source not a learned guest
+    // DAD-ize → dup → restore, ICMPv6 csum incrementally fixed at each step
+    e.push(immediate_data(NFT_REG_1, &[0u8; 16]));
+    e.push(payload_set(NFT_PAYLOAD_NETWORK_HEADER, V6_SADDR, 16, NFT_REG_1, Some((V6_ICMP_CSUM_FROM_NET, 0))));
+    e.push(immediate_data(NFT_REG_1, &[200u8]));
+    e.push(payload_set(NFT_PAYLOAD_TRANSPORT_HEADER, TH_NSNA_OPT, 1, NFT_REG_1, Some((TH_ICMP_CSUM, 0))));
     e.extend(term_dup(fwd0));
+    e.push(payload_set(NFT_PAYLOAD_NETWORK_HEADER, V6_SADDR, 16, NFT_REG_3, Some((V6_ICMP_CSUM_FROM_NET, 0))));
+    e.push(immediate_data(NFT_REG_1, &[1u8]));
+    e.push(payload_set(NFT_PAYLOAD_TRANSPORT_HEADER, TH_NSNA_OPT, 1, NFT_REG_1, Some((TH_ICMP_CSUM, 0))));
     e
 }
 

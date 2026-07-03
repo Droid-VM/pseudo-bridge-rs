@@ -158,6 +158,7 @@ ebpf 速記:`store(off,v)`=`bpf_skb_store_bytes`、`redirect(d)`=`bpf_redirect(d
 
 | condition(pseudo) | ebpf action | nft action |
 |---|---|---|
+| `eth.src == HOSTMAC`(反射的自我封包) | `return SHOT` | `drop` |
 | `eth.dst==HOSTMAC & ip.dst ∈ host` | `return OK` | `accept` |
 | `arp.tpa ∈ host` | `return OK` | `accept` |
 | `pkttype ∈ {bcast,mcast}` | `clone(fwd0)`<br>`return OK` | `dup to "fwd0"` |
@@ -165,7 +166,8 @@ ebpf 速記:`store(off,v)`=`bpf_skb_store_bytes`、`redirect(d)`=`bpf_redirect(d
 | `eth.dst==HOSTMAC & arp.tpa ∈ ip2mac` | `store(@arp.tha,m)`<br>`store(@eth.dst,m)`<br>`redirect(fwd0)` | `arp daddr ether set arp daddr ip map @ip2mac4`<br>`ether daddr set arp daddr ip map @ip2mac4`<br>`fwd to "fwd0"` |
 | else(`eth.dst==HOSTMAC`,非 host/ip2mac) | `return OK` | `accept` |
 
-> 前兩列把 host 自有 IP 最先放行(hostip 最優先;vm 用相同 IP 會被無視)。末列把未知 `dst==HOSTMAC` 交給 host stack(見 §host 共存 ⚠)。
+> **首列(反射 guard)**:Wi-Fi AP 會把 STA 自己送出的 frame 打回來——廣播/多播在下一個 DTIM 重播給整個 BSS(含發送者),unicast 目的地是 STA 自己的 mac 會被 hairpin(實機抓包證實,廣播 ~75ms、unicast ~3ms 後回到 up0 ingress)。src==HOSTMAC 的入向封包**只可能**是這種自我副本;不擋的話,反射回來的 `--arp-keepalive` GARP(guest-ip is-at HOSTMAC)會被 bcast dup 打進 guest bridge → host 自己在 br 上的 guest 鄰居項被 garp override 成 HOSTMAC → host→guest 封包轉進 fwd0 被 OUT 首列 drop,**每個 keepalive 週期黑洞數秒**;hairpin 回來的 ARP reply 也會被 in demux 塞回 guest,把 guest 的 host 鄰居項一直釘在 HOSTMAC。此列必須在 host-accept 之前。
+> 之後兩列把 host 自有 IP 最先放行(hostip 最優先;vm 用相同 IP 會被無視)。末列把未知 `dst==HOSTMAC` 交給 host stack(見 §host 共存 ⚠)。
 
 ### direct mode
 
@@ -187,6 +189,7 @@ ebpf 速記:`store(off,v)`=`bpf_skb_store_bytes`、`redirect(d)`=`bpf_redirect(d
 
 | condition(pseudo) | ebpf action | nft action |
 |---|---|---|
+| `eth.src == HOSTMAC`(反射的自我封包;同 fwd IN 首列) | `return SHOT` | `drop` |
 | `eth.dst==HOSTMAC & ip.dst ∈ host` | `return OK` | `accept` |
 | `arp.tpa ∈ host` | `return OK` | `accept` |
 | `eth.dst==HOSTMAC & ip.dst ∈ ip2mac`(IP/NA/uRA) | `store(@eth.dst, ip2mac[ip.dst])`<br>`return OK` | `ether daddr set ip daddr map @ip2mac`<br>`accept` |
@@ -237,11 +240,16 @@ ebpf 速記:`store(off,v)`=`bpf_skb_store_bytes`、`redirect(d)`=`bpf_redirect(d
   - 觀察:datapath OUT 本來就會 learn VM 的 ARP-reply(`spa`)/ NA(target)/ NS。所以只要**讓 host 的查詢觸達 VM**,VM 一回應就被學到、vmroute 就建起來。
   - 演算法(up0 egress,正規化 src 之後):
 
-        if (ARP request 或 NS) and srcip ∉ ip2mac(host 發起,非已學 guest):
-            clone_redirect(skb, fwd0)            # **clone 不 redirect**:原包仍出 up0 → gateway 照樣解析得到
+        if (廣播 ARP request 或 solicited-node 多播 NS) and srcip ∉ ip2mac(host 發起,非已學 guest):
+            匿名化 → clone_redirect(skb, fwd0) → 還原   # **clone 不 redirect**:原包(還原後)仍出 up0 → gateway 照樣解析得到
         # 額外 guard:ARP 要 spa ≠ 0.0.0.0、NS 要 src ≠ ::(都不 clone 位址探測 —— RFC 5227 ARP ACD probe / DAD NS:
         #            探測者用 0/:: 當 src,永遠不在 ip2mac,不擋的話會把 guest 自己的探測 clone 回 vmbr → 探測者收到 →
         #            誤判衝突 → 凡做 ACD 的 client(如 dhcpcd)拒絕每個 offer、無限換 IP)。srcip ∉ ip2mac 用 ebpf map lookup / nft lookup_inv 反向成員測試
+
+  - **clone 必須位址匿名化**(改 → clone → 還原;clone 是 snapshot,原包不受影響):clone 打進 vmbr 後,**目標 guest 會按 RFC 826/4861 從 sender 欄位更新鄰居快取**。host 的原始查詢帶 `spa=host-ip, sha=HOSTMAC`(NS 則 `src=host-ip, SLLAO=HOSTMAC`)——這個對映在**上游段**正確、在 **bridge 段**錯誤(host 在 bridge 段的身分是 br mac):guest 一旦 cache 了 host-ip→HOSTMAC,它回 host 的所有流量都被 OUT MAC-NAT 吸出 up0(host↔VM 斷,只能靠 AP hairpin 苟活)。做法:
+    - **v4**:clone 的 `spa` 改 0.0.0.0(= RFC 5227 ACD probe 形式)。收方無 sender 可 cache;位址持有者仍必須 defend(Linux 對 sip==0 直接回 unicast reply 到 sha、Windows 支援 ACD)→ reply 到 HOSTMAC → 過 fwd0 被學,流程不變。ARP 無 csum,改/還原零成本。
+    - **v6**:clone 的 `ip6.src` 改 ::、SLLAO type 改成未定義值 200(= DAD NS 形式;RFC 4861 §7.1.1 只拒絕「帶*可辨識* source-lladdr option 的 DAD NS」,未知 option 一律忽略;不能真移除 option——skb 縮短改不動)。持有者以 **NA→ff02::1(all-nodes 多播,帶 TLLAO)** defend → flood 過 fwd0 被學。兩處改寫都在 ICMPv6 csum 覆蓋範圍(src 經 pseudo-header)→ 增量修 csum、clone 後全部還原。
+    - **只 clone 廣播 ARP / solicited-node 多播 NS**:unicast NUD probe 本來就到不了 silent guest(kernel 失敗後自己會退回多播解析),而且 host 對 gateway 的週期性 NUD probe 若被 clone,等於**常態性**把 host 位址打進 vmbr(修正前實機上 gateway NUD 就是 v6 下毒源之一)。DAD NS 也要求 dst 是 solicited-node 多播(Linux 對 unicast DAD NS 直接丟),與此限制自洽。
 
   - 流程:host ARP/NS G(出 up0)→ clone 到 fwd0→fwd1→vmbr→VM → VM 回 ARP-reply/NA(進 fwd0 ingress = OUT)→ **learn G→vmmac**、建 vmroute G/128→br → host **重試**(ping/TCP re-tx)時 /32·/128 比 up0 的連線 prefix 更specific → 改在 br 上解析 → 連上。原查詢那次因回應沒進 host stack 會逾時,靠重試成立(延遲約一個 retry)。
   - 兩道 guard 互補,各擋一種「不該 clone 的 out 廣播」:
@@ -277,12 +285,28 @@ rust 端不分 backend、統一處理:
 
     timer 週期 = timeout/2,交替 probe / flush(probe 一拍、flush 下一拍,相差 timeout/2):
       probe 拍:對每個 proxied guest 由 **fwd0 注入**(userspace AF_PACKET,**非 ebpf**——nft 路線同樣可用)一個
-                ARP-request(v4)/ NS(v6),sender = 同 family 的 host IP,送進 vmbr。
+                **位址匿名探測**:v4 = RFC 5227 ACD probe(ARP-request,`spa=0.0.0.0`、sha=HOSTMAC)、
+                v6 = DAD 式 NS(`src=::`、**無 SLLAO**、dst=solicited-node 多播),送進 vmbr。
       flush 拍:同上「每 timeout 秒」的老化(此時距上次 probe 才 timeout/2)。
 
-    - guest 仍持有 IP → 回 ARP-reply/NA → 進 fwd0 ingress(OUT path)→ `mark(seen)`(nft `update @seen` / ebpf `seen=1`,
-      和一般 guest 流量同路徑;**已確認 ARP-reply 用 spa、NA 用 target/saddr 都會 mark**)→ flush 時仍存活 → **不被踢**(proxy 續命)。
-      副效:該 reply 經 OUT MAC-NAT 成 `G@HOSTMAC` 轉去上游 → 順帶刷新 gateway 的鄰居快取(直接緩解 v4 flap)。
+    ⚠ probe **絕不能帶 host IP 當 sender**(修正前的實機事故):它被投遞在 bridge 段,guest 會按 RFC 826/4861
+      從 request 的 sender 欄位更新鄰居快取 → guest 的 host-ip 項被釘成 HOSTMAC(bridge 段正確身分是 br mac)
+      → guest 回 host 的流量全部被 OUT MAC-NAT 吸出 up0 → **host↔VM 每個 probe 週期黑洞一次**(能不能通全看
+      AP 肯不肯 hairpin)。spa=0 / src=:: 讓收方**無物可 cache**,而位址持有者仍必須 defend——keepalive 只需要
+      那個 defend 回應。
+
+    ⚠ **DAD 衝突寬限**:probe 跳過「剛出現 control frame(learn 事件,含 no-op 重學)」的 entry,
+      寬限 = `min(timeout/2, 5s)`。guest 的 DAD NS 本身就是 learn 事件(從 target 學、隨即裝 proxy)——位址在
+      guest 上可能還是 TENTATIVE,這時對它發 DAD 式 NS 會被 RFC 4862 判成「別的節點也在 DAD 同一位址」→
+      guest **放棄該位址**(實測:SLAAC lease 消失)。跳過零成本:同一個 control frame 已 mark seen,
+      該 entry 本來就活過下一次 flush。
+      **上限不變式:寬限 ≤ flush→probe 間隔(= timeout/2)**——probe 落在兩次 flush 正中間,寬限不超過該間隔
+      時「probe 被跳過」必然表示 control frame 晚於上一次 flush(seen 已標記),下一次 flush 不可能誤刪;
+      寬限更長會出現 flush →(被跳過的 probe)→ flush 的對齊,把沉默但在場的 guest 踢掉(實測踩過)。
+
+    - guest 仍持有 IP → defend:v4 回 unicast ARP-reply 到 sha=HOSTMAC、v6 回 **NA→ff02::1**(多播,帶 TLLAO)
+      → 都進 fwd0 ingress(OUT path)→ `mark(seen)`(nft `update @seen` / ebpf `seen=1`,和一般 guest 流量同路徑;
+      **已確認 ARP-reply 用 spa、NA 用 target/saddr 都會 mark**)→ flush 時仍存活 → **不被踢**(proxy 續命)。
     - guest 釋放了 IP → 不回應 probe → seen 自然過期 → ~timeout 後 flush 踢掉、proxy 移除。
     - 只 probe **proxied**(`nd_proxied`)entry;plain fwd / direct 不開 probe(維持每 timeout 一次 flush,無多餘 ARP/NS)。
 
@@ -599,7 +623,8 @@ on_arp_keepalive():
             send(up0, garp(G))
 ```
 
-- **迴圈安全(天然成立)**:注入 frame `src==HOSTMAC` → egress_guard 不命中;`op=reply` → discovery-dup 只 clone `op==request`,不會被回灌 vmbr。GARP 同(op=2)。
+- **迴圈安全**:注入 frame `src==HOSTMAC` → egress_guard 不命中;`op=reply` → discovery-dup 只 clone `op==request`,不會被回灌 vmbr。GARP 同(op=2)。
+  ⚠ **egress 側天然成立還不夠——AP 會把它們打回來**(實機證實:GARP 廣播在下一個 DTIM 被 AP 重播回 STA,一次還兩份):反射副本從 **up0 ingress** 進來,沒有 IN 首列的 `src==HOSTMAC drop` 時會被 bcast dup 打進 vmbr,把 host 自己 br 上的 guest 鄰居項 override 成 HOSTMAC → host→guest 每 GARP 週期黑洞數秒(= 2026-07 實機事故的主因)。keepalive 的安全性依賴 IN 反射 guard,不是可選項。
 - **涵蓋範圍**:gateway 100%(host 自身流量使其常駐鄰居表 + 缺席補解析);「只跟 VM 講話、不跟 host 講話」的 LAN peer 不在 host 鄰居表,僅靠 GARP best-effort(STALE 可用但會 flaky)——上限,文件化。
 - **範圍限定 v4**:v6 NS offload 多 slot 無此問題;且 RFC 4861 下 unsolicited NA 不 assert REACHABLE(只有 solicited NA 會),發了沒有等價效果。
 - **mode 無關**(fwd/direct 都可開;頻率與 entry 數成本 = entries × (鄰居數+1) 個 60B frame/拍,可忽略),目標場景是 fwd(Wi-Fi STA)。
@@ -686,6 +711,9 @@ on_arp_keepalive():
 | 16 | host→**靜默** VM discovery(僅 fwd) | VM 配 static IP、完全不發包 → host 連 VM:up0-egress discovery dup 把 host 的 ARP/NS clone 到 fwd0 → VM 回應被學、vmroute 建起 → 重試連上(`func-silent-vm.sh`,nft+ebpf) |
 | 17 | offload keepalive(僅 offload) | timeout=5、guest 發包後**靜默 15s**:keepalive probe(timeout/2 週期、fwd0 注入)讓 proxied entry 不被踢 → entry 仍在、**gw→guest 仍通**;guest 釋放 IP 後 ~timeout 被踢、gw→guest 轉不通(`func-offload-workaround.sh` Phase C + `func-offload-keepalive.sh`,nft 含 bpf-blocked) |
 | 18 | ARP keepalive(`--arp-keepalive`) | 等價場景模擬韌體單 v4 slot:**gw egress 只放行 `tpa==host` 的 ARP request、其餘丟**;host↔gw 先通訊建鄰居表;guest 持 permanent gw neigh(不重 ARP 的窗口)。斷言:off → guest↔gw v4 死、gw entry FAILED;`--arp-keepalive 2` → 恢復(單播 reply 解開 FAILED entry),guest **靜默 10s 後** gw entry 仍 REACHABLE、gw→guest 100% 通(`func-arp-keepalive.sh`,nft bpf-blocked + ebpf) |
+| 19 | **反射自我封包 guard** | 從上游注入「AP 反射」形式的自我 GARP(`src==HOSTMAC`、guest-ip is-at HOSTMAC)→ **不得**進 vmbr:host 的 guest 鄰居項不被 override、host↔VM 前後皆 100% 通(`reflected_garp_no_poison`;另 apf/qcom 單元全程以 upsim `--reflect` 跑,所有案例都在「AP 會反射」條件下驗證) |
+| 20 | **probe 位址匿名**(僅 offload) | vmport 抓包一個 probe 週期:probe 必為 ACD 形式(`tell 0.0.0.0`)/ DAD 形式(`src=::`),**不得**帶 host IP 當 sender;guest 的 host 鄰居項不被釘成 HOSTMAC;host↔VM 跨 probe 週期 100% 通(`probe_no_poison`) |
+| 21 | **discovery clone 位址匿名**(僅 fwd) | host 解析未知位址時,guest 側抓包看到的 clone 必為 `tell 0.0.0.0` / `src=::` 形式,**不得**出現 host-ip 當 sender(`discovery_clone_anonymous`) |
 
 額外功能腳本(矩陣外、各自 nft+ebpf):`func-silent-vm.sh`(案例 16)、`func-offload-workaround.sh`(`--offload-workaround` / `fwd-with-offload`:apfsim 模擬 APF,gateway→guest off→fail/on→pass + proxy 機制斷言 + Phase C keepalive 案例 17)、`func-offload-keepalive.sh`(案例 17 位址層 + 釋放→踢除,nft 跑在 bpf()-blocked seccomp 下證明 probe 無需 ebpf)、`func-arp-keepalive.sh`(案例 18,§ARP keepalive)。
 

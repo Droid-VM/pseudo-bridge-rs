@@ -9,6 +9,11 @@
 
 upsim modes: portsec (inbound untouched) | apf (ARP/NS offload over all up0 addrs)
 | qcom (offload over primary v4 + all v6 — the powersave single-v4-slot firmware).
+The Wi-Fi sims (apf/qcom) also run with --reflect: a real AP echoes the STA's own
+broadcasts back down (next DTIM) and hairpins unicast-to-own-mac — confirmed on
+device, and the path by which pbridge's own GARPs/probes can re-enter up0 ingress
+and poison neighbour caches unless dropped there. portsec models a wired port (no
+echo).
 """
 
 import subprocess
@@ -75,12 +80,13 @@ class Topo:
            "net.ipv6.conf.real_up0.disable_ipv6=1", ns="phone")
         sh("ip", "-n", "phone", "link", "set", "real_up0", "up")
 
-        # the upstream simulator — always in the path
+        # the upstream simulator — always in the path. Wi-Fi sims get the AP echo.
         LEAK_LOG.write_text("")
+        reflect = ("--reflect",) if self.sim in ("apf", "qcom") else ()
         self.upsim = spawn(str(UPSIM), "--upstream", "real_up0",
                            "--up-tap", "helper_out", "--host-tap", "up0",
                            "--mode", self.sim, "--leak-log", str(LEAK_LOG),
-                           ns="phone", log="/tmp/upsim.log")
+                           *reflect, ns="phone", log="/tmp/upsim.log")
         if not until_ok(5, lambda: sh_ok("ip", "-n", "phone", "link", "show", "up0")):
             try:
                 why = Path("/tmp/upsim.log").read_text()[-300:]

@@ -24,8 +24,15 @@
 //!                 has multiple slots, proxies included). Reproduces "v6 fine, v4
 //!                 flaps" — what --arp-keepalive exists for.
 //!
+//! --reflect (Wi-Fi AP echo, recommended with apf/qcom): a real AP sends a STA's own
+//! transmissions back down at it — broadcasts/multicasts are re-broadcast to the whole
+//! BSS (including the sender, at the next DTIM), and unicast frames addressed to the
+//! STA's own mac are hairpinned back. Confirmed on-device; it is how pbridge's own
+//! GARPs/keepalives re-enter up0 ingress. pbridge must drop these reflected
+//! self-frames (src==HOSTMAC) or they poison neighbour caches on both sides.
+//!
 //!   upsim --upstream <ifname> [--up-tap tap1] [--host-tap tap2]
-//!         [--mode portsec|apf|qcom] [--magic N] [--leak-log FILE]
+//!         [--mode portsec|apf|qcom] [--magic N] [--leak-log FILE] [--reflect]
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -221,6 +228,7 @@ fn main() {
     let mut mode = Mode::Apf;
     let mut magic = 4243672773u32;
     let mut leak_log: Option<String> = None;
+    let mut reflect = false;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -256,6 +264,7 @@ fn main() {
                 i += 1;
                 leak_log = argv.get(i).cloned();
             }
+            "--reflect" => reflect = true,
             _ => {}
         }
         i += 1;
@@ -329,6 +338,11 @@ fn main() {
                 let cur_mac = read_mac(&host_tap);
                 if f.len() >= 14 && f[6..12] == cur_mac {
                     write_frame(up_raw, f); // src == HOSTMAC -> allowed
+                    // AP echo: broadcast/multicast frames come back down at the next
+                    // DTIM; a unicast frame addressed to the STA itself is hairpinned.
+                    if reflect && (f[0] & 1 == 1 || f[0..6] == cur_mac) {
+                        write_frame(host_raw, f);
+                    }
                 } else if f.len() >= 14 {
                     if let Some(log) = leak_file.as_mut() {
                         let t = std::time::SystemTime::now()

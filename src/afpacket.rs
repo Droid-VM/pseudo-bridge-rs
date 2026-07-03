@@ -79,9 +79,9 @@ impl Injector {
     }
 }
 
-/// ARP request "who has `target`, tell `sender`@hostmac" (broadcast). Used by the
-/// offload keepalive probe (injected on fwd0 → vmbr): a guest still holding `target`
-/// replies, refreshing its entry's liveness (and the upstream's cache for it).
+/// ARP request "who has `target`, tell `sender`@hostmac" (broadcast). Used by
+/// --arp-keepalive to re-solicit a gateway that fell out of up0's neighbour table
+/// (goes upstream only — its sender MUST be a real host IP so the gateway can reply).
 pub fn build_arp_request(target: Ipv4Addr, sender: Ipv4Addr, hostmac: Mac) -> Vec<u8> {
     let mut f = Vec::with_capacity(42);
     f.extend_from_slice(Mac::BROADCAST.bytes()); // dst
@@ -99,27 +99,55 @@ pub fn build_arp_request(target: Ipv4Addr, sender: Ipv4Addr, hostmac: Mac) -> Ve
     f
 }
 
-/// Neighbor Solicitation for `target`, src=`src`@hostmac, to target's solicited-node
-/// multicast, with SLLAO=hostmac. Offload keepalive probe (v6 counterpart of the ARP one).
-pub fn build_ns(target: Ipv6Addr, src: Ipv6Addr, hostmac: Mac) -> Vec<u8> {
+/// RFC 5227 ACD-style ARP probe for `target`: broadcast request, spa=0.0.0.0,
+/// sha=hostmac. The offload keepalive probe (injected on fwd0 → vmbr). spa=0 is the
+/// point: an ARP request's spa/sha pair updates the receiver's cache (RFC 826), and
+/// this frame is delivered INSIDE the guest bridge where the host's L2 identity is the
+/// bridge mac, not HOSTMAC — a probe carrying "host-ip @ HOSTMAC" repoints the guest's
+/// entry for the host and its host-bound replies then detour out the uplink. With
+/// spa=0 there is nothing to cache; the owner still defends (Linux answers sip==0
+/// probes, Windows implements ACD), and its reply — unicast to sha=HOSTMAC — crosses
+/// fwd0-ingress where the OUT path marks `seen`/learns exactly like any guest ARP.
+pub fn build_arp_probe(target: Ipv4Addr, hostmac: Mac) -> Vec<u8> {
+    let mut f = Vec::with_capacity(42);
+    f.extend_from_slice(Mac::BROADCAST.bytes()); // dst
+    f.extend_from_slice(hostmac.bytes()); // src
+    f.extend_from_slice(&ETHERTYPE_ARP.to_be_bytes());
+    f.extend_from_slice(&1u16.to_be_bytes()); // htype ethernet
+    f.extend_from_slice(&0x0800u16.to_be_bytes()); // ptype IPv4
+    f.push(6); // hlen
+    f.push(4); // plen
+    f.extend_from_slice(&1u16.to_be_bytes()); // op = request
+    f.extend_from_slice(hostmac.bytes()); // sha
+    f.extend_from_slice(&[0u8; 4]); // spa = 0.0.0.0 (ACD probe: never cached by receivers)
+    f.extend_from_slice(&[0u8; 6]); // tha (unknown)
+    f.extend_from_slice(&target.octets()); // tpa
+    f
+}
+
+/// DAD-style Neighbor Solicitation for `target`: src=::, NO SLLAO, to the target's
+/// solicited-node multicast. Offload keepalive probe, v6 counterpart of
+/// `build_arp_probe` and non-poisonous for the same reason: RFC 4861 forbids cache
+/// updates from an NS with an unspecified source (and a DAD NS carries no SLLAO), so
+/// the guest learns nothing — but as the address owner it MUST defend with an NA to
+/// ff02::1 (all-nodes multicast, TLLAO included), which floods across fwd0-ingress
+/// and marks `seen`/learns like any guest NA.
+pub fn build_ns_dad(target: Ipv6Addr, hostmac: Mac) -> Vec<u8> {
     let t = target.octets();
     let sol = Ipv6Addr::new(
         0xff02, 0, 0, 0, 0, 1, 0xff00 | t[13] as u16, (t[14] as u16) << 8 | t[15] as u16,
     );
     let dmac = Mac([0x33, 0x33, 0xff, t[13], t[14], t[15]]);
-    // ICMPv6 NS: type(1) code(1) csum(2) reserved(4) target(16) + SLLAO(8) = 32 bytes
-    let mut icmp = vec![0u8; 32];
+    // ICMPv6 NS: type(1) code(1) csum(2) reserved(4) target(16), no options = 24 bytes
+    let mut icmp = vec![0u8; 24];
     icmp[0] = 135; // NS
     icmp[8..24].copy_from_slice(&t); // target
-    icmp[24] = 1; // option type SLLAO
-    icmp[25] = 1; // length (8 bytes)
-    icmp[26..32].copy_from_slice(hostmac.bytes());
     let mut l3 = vec![0u8; 40];
     l3[0] = 0x60; // version 6
     l3[4..6].copy_from_slice(&(icmp.len() as u16).to_be_bytes());
     l3[6] = IPPROTO_ICMPV6;
     l3[7] = 255; // hop limit
-    l3[8..24].copy_from_slice(&src.octets());
+    // l3[8..24] stays :: (unspecified source — the DAD form)
     l3[24..40].copy_from_slice(&sol.octets());
     l3.extend_from_slice(&icmp);
     crate::packet::fix_icmpv6_csum(&mut l3);
@@ -237,6 +265,39 @@ mod tests {
         assert_eq!(&f[28..32], &[10, 0, 0, 5]); // spa = guest
         assert_eq!(&f[32..38], gw.bytes()); // tha
         assert_eq!(&f[38..42], &[10, 0, 0, 1]); // tpa = neighbour
+    }
+
+    #[test]
+    fn arp_probe_is_acd_form() {
+        let hm: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let f = build_arp_probe(Ipv4Addr::new(10, 0, 0, 5), hm);
+        assert_eq!(f.len(), 42);
+        assert_eq!(&f[0..6], Mac::BROADCAST.bytes());
+        assert_eq!(&f[6..12], hm.bytes());
+        assert_eq!(&f[20..22], &1u16.to_be_bytes(), "op request");
+        assert_eq!(&f[22..28], hm.bytes()); // sha
+        assert_eq!(&f[28..32], &[0, 0, 0, 0], "spa MUST be 0.0.0.0 (never cached)");
+        assert_eq!(&f[38..42], &[10, 0, 0, 5]); // tpa
+    }
+
+    #[test]
+    fn ns_probe_is_dad_form() {
+        let hm: Mac = "02:00:00:00:00:01".parse().unwrap();
+        let tgt: Ipv6Addr = "fd00::5".parse().unwrap();
+        let f = build_ns_dad(tgt, hm);
+        assert_eq!(&f[6..12], hm.bytes());
+        // IPv6 src (frame offset 14+8) MUST be :: — receivers can't cache-update
+        assert_eq!(&f[22..38], &[0u8; 16], "NS src must be unspecified");
+        // solicited-node dst
+        assert_eq!(&f[38..40], &[0xff, 0x02]);
+        assert_eq!(f[54], 135); // NS
+        assert_eq!(&f[62..78], &tgt.octets()); // target
+        assert_eq!(f.len(), 14 + 40 + 24, "no SLLAO (a DAD NS carries no options)");
+        // csum sanity: recompute over the frame's L3 and expect no change
+        let mut l3 = f[14..].to_vec();
+        let before = [l3[42], l3[43]];
+        crate::packet::fix_icmpv6_csum(&mut l3);
+        assert_eq!(&[l3[42], l3[43]], &before, "checksum must already be correct");
     }
 
     #[test]

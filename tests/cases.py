@@ -135,6 +135,47 @@ def neigh_coexist(c: Ctx):
     expect_ping("vm1", NEIGH1_4, "vm1 -> neigh1 (v4, through MAC-NAT)")
 
 
+# ------------------------------------------- reflected self-frames (AP echo)
+
+# Raw-socket sender: one broadcast gratuitous ARP reply "ip is-at mac" with the ethernet
+# src forged to that same mac — byte-identical to what a Wi-Fi AP sends back down when it
+# re-broadcasts the host's own GARP to the BSS (observed on-device at the next DTIM).
+_SEND_GARP_PY = r'''
+import socket, struct, sys
+iface, ipstr, macstr = sys.argv[1], sys.argv[2], sys.argv[3]
+mac = bytes(int(x, 16) for x in macstr.split(":"))
+ip = socket.inet_aton(ipstr)
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+s.bind((iface, 0))
+arp = struct.pack("!HHBBH", 1, 0x0800, 6, 4, 2) + mac + ip + mac + ip  # sha==tha, spa==tpa
+s.send(b"\xff" * 6 + mac + struct.pack("!H", 0x0806) + arp)
+'''
+
+
+@case(desc="reflected self-GARP (AP echo of our own keepalive) is dropped at up0 ingress: "
+           "host's neighbour entry for the guest survives, host<->vm stays at 100%")
+def reflected_garp_no_poison(c: Ctx):
+    # pbridge's --arp-keepalive GARP says "guest-ip is-at HOSTMAC" — correct on the wire,
+    # but a Wi-Fi AP echoes the broadcast back at the sender. Without the src==HOSTMAC
+    # ingress drop, the echo is dup'd into the guest bridge, arp_is_garp overrides the
+    # host's own neighbour entry for the guest to HOSTMAC, and every host->guest frame
+    # then crosses to fwd0 where the OUT hook drops it (BRMAC/self guard): host<->VM
+    # black-holes for seconds each keepalive period — the exact on-device failure.
+    hostmac = c.topo.mac_of("phone", "up0").lower()
+    expect_ping("phone", VM1_4, "host -> vm1 up before the echo")
+    Path("/tmp/send_garp.py").write_text(_SEND_GARP_PY)
+    for _ in range(3):  # a real AP echoed each GARP twice; three is plenty
+        r = sh("python3", "/tmp/send_garp.py", "wanbr", VM1_4, hostmac, ns="gw")
+        expect(r.returncode == 0, f"garp injector errored: {r.stderr.strip()}")
+        time.sleep(0.2)
+    time.sleep(0.5)  # let any (buggy) dup + neigh override land
+    lladdr = c.topo.neigh_lladdr("phone", VM1_4).lower()
+    expect(lladdr != hostmac,
+           "host neigh entry for vm1 repointed to HOSTMAC by a reflected GARP")
+    expect(ping_all("phone", VM1_4), "host -> vm1 at 100% right after the echoed GARP")
+    expect(ping_all("vm1", HOST4), "vm1 -> host at 100% right after the echoed GARP")
+
+
 # ---------------------------------------------------------------- silent VM / DHCP
 
 # Raw-socket helper (run inside the guest netns): fire one RFC 5227 ACD probe and report
@@ -197,6 +238,35 @@ def arp_probe_no_reflect(c: Ctx):
     finally:  # restore the silent/unaddressed vm3 the cases below expect
         sh("ip", "-n", "vm3", "addr", "flush", "dev", "eth0")
         sh("ip", "-n", "vm3", "link", "set", "eth0", "down")
+
+
+@case(requires=lambda c: c.mode != "direct",
+      desc="discovery-dup clone is address-anonymous: host resolution of an unknown "
+           "target floods the bridge as ACD probe / DAD NS, never as host-ip@HOSTMAC")
+def discovery_clone_anonymous(c: Ctx):
+    # The clone teaches whichever guest owns the target — but it is ALSO an ARP/NS the
+    # other guests parse. If it carried sender = host-ip @ HOSTMAC, the *target* guest
+    # would cache the host at HOSTMAC (wrong on the bridge segment — the host is the
+    # bridge mac there) and its host-bound replies would detour out the uplink. The fix
+    # zeroes the ARP spa (RFC 5227 probe form) and DAD-izes the NS (src=::, SLLAO
+    # neutralized) for the clone only; the wire copy keeps the real sender.
+    cap = subprocess.Popen(
+        ["ip", "netns", "exec", "vm1", "timeout", "6", "tcpdump", "-l", "-n",
+         "-i", "eth0", "arp or icmp6"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    time.sleep(0.5)
+    ping("vm1", GW4)  # ensure vm1 is learned (host IPs must not look like guests)
+    ping("phone", "10.0.0.222", count=2)  # unknown v4 -> broadcast ARP, cloned
+    ping("phone", "fd00::222", count=2)   # unknown v6 -> solicited-node NS, cloned
+    out, _ = cap.communicate()
+    expect("who-has 10.0.0.222 tell 0.0.0.0" in out,
+           "v4 discovery clone missing or not ACD-ized (no spa=0 probe on the guest side)")
+    expect(f"who-has 10.0.0.222 tell {HOST4}" not in out,
+           "v4 discovery clone leaked host-ip as its ARP sender into the bridge")
+    expect(":: > ff02::1:ff00:222" in out and "who has fd00::222" in out,
+           "v6 discovery clone missing or not DAD-ized (no src=:: NS on the guest side)")
+    expect(f"{HOST6} > ff02::1:ff00:222" not in out,
+           "v6 discovery clone leaked the host v6 as its NS source into the bridge")
 
 
 @case(requires=lambda c: c.mode != "direct",
@@ -416,6 +486,47 @@ def offload_keepalive(c: Ctx):
         sh("ip", "-n", "vm1", "addr", "add", f"{VM1_6}/64", "dev", "eth0", "nodad")
 
 
+@case(requires=offloaded,
+      desc="offload keepalive probe is address-anonymous (ACD/DAD form): guests' "
+           "neighbour entries for the host survive probe cycles, host<->vm at 100%")
+def probe_no_poison(c: Ctx):
+    # The probe is injected INSIDE the guest bridge, where the host's L2 identity is
+    # the bridge mac. The old sender=host-ip@HOSTMAC form made the probed guest cache
+    # the host at HOSTMAC (RFC 826 updates from a request's spa/sha), so its host-bound
+    # replies were MAC-NAT'd out the uplink — host<->VM black-holed every probe period
+    # until the guest re-ARP'd (the on-device 30s outage cycle). The ACD/DAD form gives
+    # the guest nothing to cache while still soliciting the defense reply that marks
+    # `seen`. Assert both the wire form of the probe and the guest's cache health.
+    hostmac = c.topo.mac_of("phone", "up0").lower()
+    expect_ping("vm1", GW4, "learn vm1 v4")
+    expect_ping("vm1", GW6, "learn vm1 v6")
+    expect(until_ok(8, lambda: proxies(VM1_4) and proxies(VM1_6)), "proxies installed")
+    expect_ping("vm1", HOST4, "vm1 -> host v4 (prime vm1's neigh entry for the host)")
+    expect_ping("vm1", HOST6, "vm1 -> host v6 (prime vm1's neigh entry for the host)")
+    # capture one full probe period off the guest-facing port (probe fires every
+    # 2 aging ticks = PB_TIMEOUT); -e so the probe (src == HOSTMAC) is separable from
+    # the host's own legitimate vmbr ARP traffic (src == bridge mac).
+    cap = subprocess.Popen(
+        ["ip", "netns", "exec", "phone", "timeout", str(PB_TIMEOUT + 3), "tcpdump",
+         "-l", "-e", "-n", "-i", "vmport", "arp or icmp6"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    out, _ = cap.communicate()
+    probe_lines = [l for l in out.splitlines() if f"{hostmac} >" in l.lower()]
+    expect(any("tell 0.0.0.0" in l for l in probe_lines),
+           "no ACD-form v4 probe (spa=0.0.0.0) seen within a probe period")
+    expect(not any(f"tell {HOST4}" in l for l in probe_lines),
+           "v4 probe carries the host IP as its ARP sender (cache-poisoning form)")
+    expect(not any(f"{HOST6} > ff02::1:ff" in l for l in probe_lines),
+           "v6 probe carries the host IP as its NS source (cache-poisoning form)")
+    # the guest's view of the host must still be the bridge, never HOSTMAC
+    for hip in (HOST4, HOST6):
+        lladdr = c.topo.neigh_lladdr("vm1", hip).lower()
+        expect(lladdr != hostmac,
+               f"vm1's neigh entry for {hip} repointed to HOSTMAC by the probe")
+    expect(ping_all("vm1", HOST4), "vm1 -> host v4 at 100% across probe cycles")
+    expect(ping_all("phone", VM1_4), "host -> vm1 v4 at 100% across probe cycles")
+
+
 # ------------------------------------------------- qcom firmware / arp-keepalive
 # Lifecycle cases: they restart pbridge with different flags; broken MUST run before
 # hold (ordered registration). They model the real device: the firmware answers ARP
@@ -436,6 +547,12 @@ def arp_keepalive_broken(c: Ctx):
        "net.ipv4.neigh.wanbr.retrans_time_ms=200",
        "net.ipv4.neigh.wanbr.ucast_solicit=2",
        "net.ipv4.neigh.wanbr.mcast_solicit=2", ns="gw")
+    # Self-contained precondition: the learn ping below relies on vm1 BROADCAST-ARPing
+    # the gw (that request is what teaches the gw vm1's mapping — under qcom the gw's
+    # own resolution is firmware-dropped). If a previous case left vm1's gw entry
+    # REACHABLE, vm1 won't re-ARP and the gw (fast-decayed by the sysctls above) can
+    # never answer. Flush vm1's cache so the first ping always re-ARPs.
+    sh("ip", "-n", "vm1", "neigh", "flush", "all")
     expect_ping("vm1", GW4, "learn vm1 v4 first")
     sh("ip", "-n", "vm1", "neigh", "replace", GW4, "lladdr", _gw_mac(),
        "dev", "eth0", "nud", "permanent")

@@ -4,7 +4,7 @@
 //! netlink link/addr changes (recompute+diff), and the aging timer.
 #![forbid(unsafe_code)] // core algorithm: memory-safety is compiler-guaranteed here
 
-use crate::afpacket::{build_arp_reply, build_arp_request, build_ns, Injector};
+use crate::afpacket::{build_arp_probe, build_arp_reply, build_arp_request, build_ns_dad, Injector};
 use crate::backend::{Backend, CopyEvent, InitCfg, COPY_QUEUE_DEPTH};
 use crate::cli::{Cli, Engine, Mode};
 use crate::netlink::{AddrInfo, Net};
@@ -795,32 +795,49 @@ impl Core {
         Ok(())
     }
 
-    /// Solicit every proxied guest on fwd0 (toward the vmbr): ARP-request for v4, NS for v6.
-    /// A present guest's reply enters fwd0-ingress (OUT path) and refreshes its `seen` (and,
-    /// MAC-NAT'd upstream, the gateway's neighbour cache too). Sender = a host IP of the same
-    /// family so the guest answers on-link.
+    /// Solicit every proxied guest on fwd0 (toward the vmbr): an RFC 5227 ACD probe
+    /// (spa=0.0.0.0) for v4, a DAD-style NS (src=::, no SLLAO) for v6. A present guest
+    /// defends its address; the reply enters fwd0-ingress (OUT path) and refreshes its
+    /// `seen`. The probes are deliberately ADDRESS-ANONYMOUS: this frame is delivered
+    /// inside the guest bridge, where the host's L2 identity is the bridge mac — a
+    /// probe with sender = host-ip @ HOSTMAC would repoint every guest's neighbour
+    /// entry for the host to HOSTMAC, and the guests' host-bound traffic would then be
+    /// MAC-NAT'd out the uplink instead of delivered locally (host<->VM black-holes
+    /// until the guest re-ARPs). spa=0 / src=:: give receivers nothing to cache, while
+    /// still soliciting the defense reply the keepalive needs (see afpacket builders).
+    ///
+    /// DAD-conflict grace: a guest that JUST produced a control frame is skipped. Its
+    /// v6 DAD NS is itself a learn event (target-learned → proxied within ms), so the
+    /// address may still be TENTATIVE on the guest when the next probe tick fires —
+    /// and receiving someone else's DAD-form NS for a tentative address is, per RFC
+    /// 4862, a duplicate: the guest would abort the address (observed as SLAAC leases
+    /// dying under load). Skipping is free: the same control frame marked `seen`, so
+    /// the entry survives the upcoming flush without any probe.
+    ///
+    /// The grace MUST NOT exceed the flush→probe offset (= the aging tick, timeout/2):
+    /// probes fire midway between flushes, so with grace ≤ that offset a skipped probe
+    /// implies the control frame came AFTER the previous flush — seen is already marked
+    /// and the next flush can't evict. A longer grace can align as flush → (skipped
+    /// probe) → flush and age out a silent-but-present guest.
     fn probe(&self) {
         let Some(inj) = &self.fwd0_injector else { return };
         let Some(hostmac) = self.snap.hostmac else { return };
-        let host_v4 = self.snap.host_ips.iter().find_map(|a| match a.ip {
-            IpAddr::V4(v) if !is_link_local(&a.ip) => Some(v),
-            _ => None,
-        });
-        let host_v6 = self.snap.host_ips.iter().find_map(|a| match a.ip {
-            IpAddr::V6(v) if a.global => Some(v),
-            _ => None,
-        });
+        let aging_secs = (self.cli.timeout / 2).max(1); // same period the timer uses
+        let grace = Duration::from_secs(aging_secs.min(5)); // 5s covers any DAD window
         for ip in &self.nd_proxied {
+            if self
+                .entries
+                .get(ip)
+                .is_some_and(|e| e.last_ctrl.elapsed() < grace)
+            {
+                continue; // possibly mid-DAD/ACD; it just marked seen anyway
+            }
             match ip {
                 IpAddr::V4(g) => {
-                    if let Some(s) = host_v4 {
-                        let _ = inj.send_frame(&build_arp_request(*g, s, hostmac));
-                    }
+                    let _ = inj.send_frame(&build_arp_probe(*g, hostmac));
                 }
                 IpAddr::V6(g) => {
-                    if let Some(s) = host_v6 {
-                        let _ = inj.send_frame(&build_ns(*g, s, hostmac));
-                    }
+                    let _ = inj.send_frame(&build_ns_dad(*g, hostmac));
                 }
             }
         }
