@@ -298,11 +298,17 @@ rust 端不分 backend、統一處理:
     ⚠ **DAD 衝突寬限**:probe 跳過「剛出現 control frame(learn 事件,含 no-op 重學)」的 entry,
       寬限 = `min(timeout/2, 5s)`。guest 的 DAD NS 本身就是 learn 事件(從 target 學、隨即裝 proxy)——位址在
       guest 上可能還是 TENTATIVE,這時對它發 DAD 式 NS 會被 RFC 4862 判成「別的節點也在 DAD 同一位址」→
-      guest **放棄該位址**(實測:SLAAC lease 消失)。跳過零成本:同一個 control frame 已 mark seen,
-      該 entry 本來就活過下一次 flush。
+      guest **放棄該位址**(實測:SLAAC lease 消失)。
       **上限不變式:寬限 ≤ flush→probe 間隔(= timeout/2)**——probe 落在兩次 flush 正中間,寬限不超過該間隔
       時「probe 被跳過」必然表示 control frame 晚於上一次 flush(seen 已標記),下一次 flush 不可能誤刪;
       寬限更長會出現 flush →(被跳過的 probe)→ flush 的對齊,把沉默但在場的 guest 踢掉(實測踩過)。
+      ⚠ **skip 必須主動 refresh seen(`backend.refresh_seen`),不能只依賴 control frame 自己的 mark**:
+      nft 的 seen 是 kernel-clock 逾時(= timeout),control frame 若落在 flush 之後 δ 秒,其 mark 對下一次
+      flush 只剩 δ 的餘裕——而 flush 讀取靠 tokio timer,負載下晚 λ > δ 就把**活著的 guest 誤踢**
+      (vmroute 被撤 → host 回包走 up0 connected route 出錯口,黑洞到重學為止;平行跑 suite 時
+      `offload_keepalive`/`probe_no_poison` 的間歇性失敗即此,ebpf 的 mark-bit + second-chance 無此 race,
+      故只在 nft 出現)。skip 時由 userspace 重標(nft 無 element-update op → del+add 帶新 timeout;
+      ebpf 冪等設 1)⇒ 「skip ⇒ seen 剛刷新」,餘裕恆為整個 flush→probe 間隔,不再依賴 timer 準時。
 
     - guest 仍持有 IP → defend:v4 回 unicast ARP-reply 到 sha=HOSTMAC、v6 回 **NA→ff02::1**(多播,帶 TLLAO)
       → 都進 fwd0 ingress(OUT path)→ `mark(seen)`(nft `update @seen` / ebpf `seen=1`,和一般 guest 流量同路徑;
@@ -562,7 +568,12 @@ syncer 是**唯一寫/撤 kernel offload 狀態的人**。維護兩份 state、�
 **解法(順著 offload 而非對抗)**:把學到的 guest 位址**安裝到 up0 自己身上**,使其成為「本機自有位址」 → APF 改為**直接用 HOSTMAC(=up0 mac)替它回 NA/ARP-reply**(韌體 offload,零延遲、零喚醒)。**外部**回程資料封包到 up0 後,既有 IN demux 在 **tc-ingress**(早於 routing/local-delivery)就 `bpf_redirect → fwd0`,因此 up0「擁有」該位址**不影響**外部轉發。純 netlink、逐 guest 隨學隨裝,無需 framework / SELinux 介入。
 
 - **但 host→guest(本機發起)會被 local route 吃掉**:配位址時 kernel 會在 `local` 表自動加 `local <G> dev up0`(type RTN_LOCAL;`noprefixroute` 只擋 prefix route,**擋不掉 local route**),host 本機送往 G 就被 local-deliver 給自己,不再經 vmroute 轉給 guest。**解**:proxy 安裝後**刪掉那條 local route**(`del_local_route`,table local + type=local,scope/proto 用 NoWhere/Unspec 萬用比對才匹配得到)→ host 發起的 G 流量改走 vmroute 轉給 guest;位址仍**保留**(APF 照樣回 ND/ARP——回應只看位址有沒有配,與 route 無關)。
-  - v4 的 local route 同步建立、可即刻刪;**v6 的 local route 在 addr-add 回來後才非同步插入**,故 `del_local_route` 每次 reconcile 都對 proxied 位址重試(idempotent)——addr-add 觸發的後續 reconcile 會補刪到。
+  - ⚠ **local route 是 kernel 非同步插入的(addrconf work),del 撲空 = 還沒插入、不是成功**:插入是否趕在
+    我們的 delete 之前是 kernel 版本的擲硬幣(實測 6.17 上 sub-ms 的 delete 跑在插入前面、ESRCH 被誤當成功;
+    7.0 上插入先到)。而 proxy 位址的 NEWADDR 帶 magic metric、diff 為空 → **不會有後續 reconcile 補刪**,
+    殘留的 local route 就永久遮蔽 vmroute(host→guest v6 黑洞、guest→host 的回包也被吃)= 2026-07 CI 於
+    6.17 runner 上 host↔VM v6 全滅的根因。故 `del_local_route` 回傳「是否真的刪到」,**新裝 proxy 時 retry
+    到刪中為止**(20ms × ≤50,一般第 0-1 次即中);非新裝的 reconcile 維持單次 best-effort。
 
 **安裝形式(magic-metric 標記)**:proxy 位址用 `IFA_RT_PRIORITY = <magic>`(預設 4243672773)當**唯一身份標記**——kernel 會原樣存回並回報,即使 `/128 noprefixroute` 也照存(不建任何 prefix route)。
 
@@ -616,16 +627,23 @@ on_arp_keepalive():
     for gw in default_gw4() − neigh:               # gateway 被 GC(host 久無流量)→ 補解析
         send(up0, arp_request(tpa=gw, spa=host_v4, sha=HOSTMAC))
         # 回覆 tpa∈host → IN 提早 accept 進 host stack → kernel 自己補鄰居表;下一拍即覆蓋
-    for G in guests:
+    for G in host_v4s(host_ips 的非 LL v4) ∪ guests:   # host 自身 v4 一併通告,見下 ⚠
         for n in neigh:
             send(up0, arp_reply(spa=G, sha=HOSTMAC → n))   # 對方 entry → NUD_REACHABLE
         if tick % 3 == 0:                          # 廣播禮貌:廣播會喚醒整個 WLAN 的 PS client
             send(up0, garp(G))
 ```
 
+    ⚠ **host 自身 v4 也要通告(slot 被 proxy 搶走的防禦)**:韌體的單一 v4 slot 是在 up0 位址表每次變動時
+      重填的;offload 繞道裝了 guest /32 proxy 後,slot 可能落在 proxy 而非 host primary(位址列表順序隨
+      漫遊 / DHCP 續約 / entry churn 變動)——此時 powersave 下連「host 自己的 IP」的 ARP request 都被韌體
+      丟:手機出網正常(發送不受 PS 影響),但 LAN 鄰居 ping 不到手機,直到 pbridge 撤 proxy 才復原
+      (2026-07 實機事故 #2)。把 host v4 加進通告集合即免疫:映射本來就正確(host-ip is-at HOSTMAC),
+      對方永遠不需要問。頻率/迴圈安全與 guest 通告完全相同(reply 形式不觸發 discovery dup、反射被 IN 首列擋)。
+
 - **迴圈安全**:注入 frame `src==HOSTMAC` → egress_guard 不命中;`op=reply` → discovery-dup 只 clone `op==request`,不會被回灌 vmbr。GARP 同(op=2)。
   ⚠ **egress 側天然成立還不夠——AP 會把它們打回來**(實機證實:GARP 廣播在下一個 DTIM 被 AP 重播回 STA,一次還兩份):反射副本從 **up0 ingress** 進來,沒有 IN 首列的 `src==HOSTMAC drop` 時會被 bcast dup 打進 vmbr,把 host 自己 br 上的 guest 鄰居項 override 成 HOSTMAC → host→guest 每 GARP 週期黑洞數秒(= 2026-07 實機事故的主因)。keepalive 的安全性依賴 IN 反射 guard,不是可選項。
-- **涵蓋範圍**:gateway 100%(host 自身流量使其常駐鄰居表 + 缺席補解析);「只跟 VM 講話、不跟 host 講話」的 LAN peer 不在 host 鄰居表,僅靠 GARP best-effort(STALE 可用但會 flaky)——上限,文件化。
+- **涵蓋範圍**:gateway 100%(host 自身流量使其常駐鄰居表 + 缺席補解析);host 自身 v4 100%(通告集合內建,見上 ⚠);「只跟 VM 講話、不跟 host 講話」的 LAN peer 不在 host 鄰居表,僅靠 GARP best-effort(STALE 可用但會 flaky)——上限,文件化。
 - **範圍限定 v4**:v6 NS offload 多 slot 無此問題;且 RFC 4861 下 unsolicited NA 不 assert REACHABLE(只有 solicited NA 會),發了沒有等價效果。
 - **mode 無關**(fwd/direct 都可開;頻率與 entry 數成本 = entries × (鄰居數+1) 個 60B frame/拍,可忽略),目標場景是 fwd(Wi-Fi STA)。
 - 成本/功耗:radio 本就每 beacon/DTIM 醒;多送幾個小 frame 遠低於 `powersave off`(常醒)或週期 toggle powersave。

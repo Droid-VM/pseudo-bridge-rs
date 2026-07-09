@@ -294,6 +294,25 @@ impl NftBackend {
         }
     }
 
+    /// Refresh the `seen` element for ip with a fresh --timeout: control-plane analog
+    /// of the datapath's `update @seen`. Netlink has no element-update op, so
+    /// delete+add in two best-effort/strict steps: the DEL may hit an already-expired
+    /// element (fine), and a datapath update racing between the two just means the
+    /// mark is already fresh (the NEW's EEXIST is then harmless).
+    fn touch_seen(&mut self, ip: IpAddr) -> Result<()> {
+        let timeout_ms = self.cfg()?.timeout * 1000;
+        let (seen, k) = match ip {
+            IpAddr::V4(a) => ("seen4", a.octets().to_vec()),
+            IpAddr::V6(a) => ("seen6", a.octets().to_vec()),
+        };
+        let s = self.sock()?;
+        let _ = s.transaction(|ts| vec![setelem_msg(ts.seq(), NFT_MSG_DELSETELEM, seen, &k, None, None)]);
+        let s = self.sock()?;
+        s.transaction(|ts| {
+            vec![setelem_msg(ts.seq(), NFT_MSG_NEWSETELEM, seen, &k, None, Some(timeout_ms))]
+        })
+    }
+
     fn unflash_entry(&mut self, ip: IpAddr, mac: Mac) -> Result<()> {
         let m = mac.bytes().to_vec();
         let (ip2mac, valid, seen, k) = match ip {
@@ -430,6 +449,13 @@ impl Backend for NftBackend {
             self.unflash_entry(ip, mac)?;
         }
         Ok(())
+    }
+
+    fn refresh_seen(&mut self, ip: IpAddr) -> Result<()> {
+        if !self.entries.contains_key(&ip) {
+            return Ok(());
+        }
+        self.touch_seen(ip)
     }
 
     fn flush(&mut self) -> Result<Vec<IpAddr>> {

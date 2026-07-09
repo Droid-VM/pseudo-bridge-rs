@@ -72,8 +72,11 @@ def proxies(pattern: str) -> int:
 
 
 def ping_all(ns: str, dst: str, count: int = 3) -> bool:
-    """100% ping success (plain ping exits 0 on ANY reply)."""
-    r = sh("ping", f"-c{count}", "-W1", dst, ns=ns)
+    """100% ping success (plain ping exits 0 on ANY reply). -W2: the failure this guards
+    against is a seconds-long blackhole (poisoned neigh entry — no reply no matter how
+    long we wait), so a longer per-reply deadline doesn't weaken the assertion; it only
+    keeps a busy CI runner's scheduling jitter from reading as loss."""
+    r = sh("ping", f"-c{count}", "-W2", dst, ns=ns)
     return r.returncode == 0 and " 0% packet loss" in r.stdout
 
 
@@ -503,11 +506,14 @@ def probe_no_poison(c: Ctx):
     expect(until_ok(8, lambda: proxies(VM1_4) and proxies(VM1_6)), "proxies installed")
     expect_ping("vm1", HOST4, "vm1 -> host v4 (prime vm1's neigh entry for the host)")
     expect_ping("vm1", HOST6, "vm1 -> host v6 (prime vm1's neigh entry for the host)")
-    # capture one full probe period off the guest-facing port (probe fires every
-    # 2 aging ticks = PB_TIMEOUT); -e so the probe (src == HOSTMAC) is separable from
-    # the host's own legitimate vmbr ARP traffic (src == bridge mac).
+    # capture TWO probe periods off the guest-facing port (probe fires every 2 aging
+    # ticks = PB_TIMEOUT): the DAD-conflict grace legitimately skips a probe tick that
+    # lands within min(timeout/2, 5s) of the priming pings' ARP/NS chatter, so a
+    # one-period window can contain zero probes and fail the "ACD form seen" assert on
+    # timing alone. -e so the probe (src == HOSTMAC) is separable from the host's own
+    # legitimate vmbr ARP traffic (src == bridge mac).
     cap = subprocess.Popen(
-        ["ip", "netns", "exec", "phone", "timeout", str(PB_TIMEOUT + 3), "tcpdump",
+        ["ip", "netns", "exec", "phone", "timeout", str(2 * PB_TIMEOUT + 3), "tcpdump",
          "-l", "-e", "-n", "-i", "vmport", "arp or icmp6"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     out, _ = cap.communicate()

@@ -650,7 +650,8 @@ impl Core {
             return;
         }
         let plen = if family(&ip) == Family::V4 { 32 } else { 128 };
-        if !self.nd_proxied.contains(&ip) {
+        let fresh = !self.nd_proxied.contains(&ip);
+        if fresh {
             let magic = self.cli.offload_workaround_magic;
             let (nodad, deprecated) =
                 if family(&ip) == Family::V4 { (false, false) } else { (true, true) };
@@ -666,10 +667,32 @@ impl Core {
         // Drop the kernel's auto `local <ip>` route so host-originated traffic to the guest
         // forwards via the vmroute (the address stays assigned, so the upstream offload still
         // answers ND/ARP; external traffic is stolen by the ingress demux before routing).
-        // v6's local route is inserted slightly after the addr-add returns, so this runs on
-        // every reconcile pass for a proxied addr (idempotent) — the NEWADDR event triggers a
-        // follow-up reconcile by which point the route exists.
-        let _ = self.net.del_local_route(ip, plen).await;
+        //
+        // The kernel inserts that local route ASYNCHRONOUSLY (addrconf work), and whether it
+        // lands before our delete is a kernel-version coin toss: on 6.17 the sub-ms delete
+        // races AHEAD of the insert, the ESRCH looks like success, and the surviving local
+        // route blackholes host->guest v6 (and eats the host's replies for guest->host)
+        // until teardown — nothing retriggers a reconcile for a proxy addr (its NEWADDR is
+        // magic-metric and diffs empty). So on a fresh install, retry until a delete actually
+        // matches (Ok(true)); the loop exits on the first hit, typically iteration 0-1.
+        // Non-fresh reconciles keep the single best-effort pass (their route is long gone).
+        let mut deleted = self.net.del_local_route(ip, plen).await.unwrap_or(false);
+        if fresh {
+            let mut tries = 0;
+            while !deleted && tries < 50 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                deleted = self.net.del_local_route(ip, plen).await.unwrap_or(false);
+                tries += 1;
+            }
+            if deleted {
+                log::debug!("offload-proxy {ip}: local route deleted (try {tries})");
+            } else {
+                log::warn!(
+                    "offload-proxy {ip}: local route never appeared within 1s — \
+                     host->guest may be shadowed by local delivery"
+                );
+            }
+        }
     }
 
     async fn unproxy_addr(&mut self, ip: IpAddr) {
@@ -735,6 +758,13 @@ impl Core {
     ///     don't assert reachability), so the entry never decays into probing;
     ///   - GARP broadcast every GARP_EVERY ticks — best-effort STALE refresh for LAN
     ///     peers that aren't in up0's neighbour table (they only talk to the VM);
+    ///   - the HOST's own v4s are advertised alongside the guests: the firmware
+    ///     repopulates its single slot from up0's address list on every change, and
+    ///     with guest /32 proxies installed it can land on a proxy instead of the
+    ///     host primary — then powersave eats ARP requests for the HOST itself
+    ///     (outbound still works, so it presents as "LAN peers can't ping the
+    ///     phone" while the phone browses fine). Same correct mapping the host
+    ///     would answer with anyway, so pushing it is harmless;
     ///   - a gateway absent from the neighbour table (GC'd on an idle host) is
     ///     re-solicited from a host address; the next tick covers it.
     async fn on_arp_keepalive(&mut self) -> Result<()> {
@@ -767,18 +797,27 @@ impl Core {
             .into_iter()
             .filter(|gw| !have.contains(gw))
             .collect();
-        let host_v4 = self.snap.host_ips.iter().find_map(|a| match a.ip {
-            IpAddr::V4(v) if !is_link_local(&a.ip) => Some(v),
-            _ => None,
-        });
+        let host_v4s: Vec<Ipv4Addr> = self
+            .snap
+            .host_ips
+            .iter()
+            .filter_map(|a| match a.ip {
+                IpAddr::V4(v) if !is_link_local(&a.ip) => Some(v),
+                _ => None,
+            })
+            .collect();
 
         let Some(inj) = &self.injector else { return Ok(()) };
         for gw in missing_gws {
-            if let Some(src) = host_v4 {
-                let _ = inj.send_frame(&build_arp_request(gw, src, hostmac));
+            if let Some(src) = host_v4s.first() {
+                let _ = inj.send_frame(&build_arp_request(gw, *src, hostmac));
             }
         }
-        for g in &guests {
+        // Host v4s first: if the firmware slot got stolen by a proxy, the host's own
+        // reachability is what's on the line. Reply-form frames only (op=2) — the
+        // discovery dup clones op==request, so none of these re-enter the vmbr; the
+        // reflected copies (src==HOSTMAC) die on the IN guard.
+        for g in host_v4s.iter().chain(guests.iter()) {
             for (nip, nmac) in &neigh {
                 let _ = inj.send_frame(&build_arp_reply(*g, hostmac, *nip, *nmac));
             }
@@ -787,8 +826,9 @@ impl Core {
             }
         }
         log::debug!(
-            "arp-keepalive: {} guest v4 x {} neighbours{}",
+            "arp-keepalive: {} guest + {} host v4 x {} neighbours{}",
             guests.len(),
+            host_v4s.len(),
             neigh.len(),
             if garp_tick { " + garp" } else { "" }
         );
@@ -811,15 +851,16 @@ impl Core {
     /// address may still be TENTATIVE on the guest when the next probe tick fires —
     /// and receiving someone else's DAD-form NS for a tentative address is, per RFC
     /// 4862, a duplicate: the guest would abort the address (observed as SLAAC leases
-    /// dying under load). Skipping is free: the same control frame marked `seen`, so
-    /// the entry survives the upcoming flush without any probe.
+    /// dying under load). A skip re-asserts `seen` from the control plane instead
+    /// (backend.refresh_seen — see the skip branch below for why the control frame's
+    /// own datapath mark is not enough on nft).
     ///
     /// The grace MUST NOT exceed the flush→probe offset (= the aging tick, timeout/2):
     /// probes fire midway between flushes, so with grace ≤ that offset a skipped probe
-    /// implies the control frame came AFTER the previous flush — seen is already marked
-    /// and the next flush can't evict. A longer grace can align as flush → (skipped
-    /// probe) → flush and age out a silent-but-present guest.
-    fn probe(&self) {
+    /// implies the control frame came AFTER the previous flush. A longer grace can
+    /// align as flush → (skipped probe) → flush and age out a silent-but-present
+    /// guest.
+    fn probe(&mut self) {
         let Some(inj) = &self.fwd0_injector else { return };
         let Some(hostmac) = self.snap.hostmac else { return };
         let aging_secs = (self.cli.timeout / 2).max(1); // same period the timer uses
@@ -830,7 +871,17 @@ impl Core {
                 .get(ip)
                 .is_some_and(|e| e.last_ctrl.elapsed() < grace)
             {
-                continue; // possibly mid-DAD/ACD; it just marked seen anyway
+                // Possibly mid-DAD/ACD — don't solicit. But don't lean on the control
+                // frame's own seen mark either: on nft that mark is a kernel-clock
+                // timeout, and a frame that landed just after a flush leaves it with
+                // an arbitrarily thin margin over the NEXT flush — any lateness of
+                // this (tokio) timer then evicts a live guest (the parallel-suite
+                // "silent proxies survive"/"vm1->host 100%" intermittents). Re-assert
+                // it from the control plane: skip ⇒ seen fresh, margin a full period.
+                if let Err(e) = self.backend.refresh_seen(*ip) {
+                    log::debug!("probe skip refresh_seen {ip}: {e:#}");
+                }
+                continue;
             }
             match ip {
                 IpAddr::V4(g) => {

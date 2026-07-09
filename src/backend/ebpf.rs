@@ -263,6 +263,24 @@ impl Backend for EbpfBackend {
         Ok(())
     }
 
+    fn refresh_seen(&mut self, ip: IpAddr) -> Result<()> {
+        // The mark-bit + second-chance flush has no expiry race — this just sets the
+        // same bit the datapath would (idempotent), keeping the two backends uniform.
+        match ip {
+            IpAddr::V4(a) => {
+                let map = self.ebpf()?.map_mut("seen4").ok_or_else(|| anyhow!("no seen4"))?;
+                let mut s: AyaHashMap<&mut MapData, u32, u8> = AyaHashMap::try_from(map)?;
+                s.insert(v4key(a), 1u8, 0)?;
+            }
+            IpAddr::V6(a) => {
+                let map = self.ebpf()?.map_mut("seen6").ok_or_else(|| anyhow!("no seen6"))?;
+                let mut s: AyaHashMap<&mut MapData, In6, u8> = AyaHashMap::try_from(map)?;
+                s.insert(In6 { a: a.octets() }, 1u8, 0)?;
+            }
+        }
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<Vec<IpAddr>> {
         let mut alive = Vec::new();
         // seen4 second-chance

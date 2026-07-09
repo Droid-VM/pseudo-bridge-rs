@@ -44,3 +44,12 @@ jobs:
         run: uname -r; ip -V; nft --version || true
       - name: Run the suite (host envs)
         run: sudo -E env "PATH=$PATH" python3 tests/run_all_test.py -j 4 --retry 2
+      # The console summary only names the failed unit+case; the per-assert detail (which
+      # expect() tripped) lives in the unit logs. Without this, triaging a runner-only
+      # failure means rebuilding the runner environment from scratch.
+      - name: Upload suite logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: suite-logs
+          path: /tmp/pbridge-suite-*

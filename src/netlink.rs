@@ -363,7 +363,13 @@ impl Net {
     /// addresses: dropping it lets host-originated traffic to a guest forward via the
     /// vmroute instead of being delivered locally, while the address stays assigned (so the
     /// upstream ND/ARP offload still answers for it). Idempotent.
-    pub async fn del_local_route(&self, ip: IpAddr, plen: u8) -> Result<()> {
+    ///
+    /// Returns whether a route was actually deleted: `Ok(false)` = nothing matched (ESRCH/
+    /// ENOENT). The caller MUST treat false as "the insert hasn't landed yet", not success —
+    /// the kernel inserts the local route for a fresh address asynchronously, and on some
+    /// kernels (observed: 6.17; 7.0 wins the race) it lands AFTER the RTM_NEWADDR ack, so a
+    /// single fire-and-forget delete leaves the route shadowing the vmroute forever.
+    pub async fn del_local_route(&self, ip: IpAddr, plen: u8) -> Result<bool> {
         const RT_TABLE_LOCAL: u32 = 255;
         // Match the kernel's local route: type=local in table local. The builder defaults
         // scope=Universe/proto=Static, but the route is scope=host/proto=kernel — so wildcard
@@ -386,11 +392,11 @@ impl Net {
                 .build(),
         };
         match self.handle.route().del(msg).execute().await {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(true),
             Err(rtnetlink::Error::NetlinkError(e))
                 if e.raw_code() == -libc::ESRCH || e.raw_code() == -libc::ENOENT =>
             {
-                Ok(())
+                Ok(false)
             }
             Err(e) => Err(e).context("del_local_route"),
         }
