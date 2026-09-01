@@ -1,9 +1,11 @@
 //! nfnetlink_log reader (subsys NFNL_SUBSYS_ULOG=4, verified empirically). Binds the
 //! configured group in COPY_PACKET mode and turns each logged packet into a CopyEvent.
 //! NFULA_HWADDR = original guest src mac; NFULA_HWHEADER = full L2 header (ethertype at
-//! bytes 12..14); NFULA_PAYLOAD = L3; NFULA_PREFIX "R" => reinject (ND drop path).
+//! bytes 12..14); NFULA_PAYLOAD = L3; NFULA_PREFIX "R" => reinject (ND drop path),
+//! "A" => an upstream ARP request for a currently installed guest.
 
 use crate::backend::{push_copy, CopyEvent};
+use crate::packet::arp_request;
 use crate::types::Mac;
 use anyhow::{Context, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -159,7 +161,7 @@ fn parse_packet(abody: &[u8]) -> Option<CopyEvent> {
     let mut hwaddr = None;
     let mut hwheader: Option<&[u8]> = None;
     let mut payload: Option<&[u8]> = None;
-    let mut reinject = false;
+    let mut prefix = None;
     for (t, v) in parse_attrs(abody) {
         match t {
             NFULA_HWADDR => {
@@ -171,7 +173,7 @@ fn parse_packet(abody: &[u8]) -> Option<CopyEvent> {
             NFULA_HWHEADER => hwheader = Some(v),
             NFULA_PAYLOAD => payload = Some(v),
             NFULA_PREFIX => {
-                reinject = v.first() == Some(&b'R');
+                prefix = v.first().copied();
             }
             _ => {}
         }
@@ -186,7 +188,18 @@ fn parse_packet(abody: &[u8]) -> Option<CopyEvent> {
         let dst_mac = Mac::from_slice(&hwheader[0..6])?;
         let hwaddr = hwaddr.or_else(|| Mac::from_slice(&hwheader[6..12]))?;
         let ethertype = u16::from_be_bytes([hwheader[12], hwheader[13]]);
-        Some(CopyEvent::Nflog { hwaddr, dst_mac, ethertype, l3: payload.to_vec(), reinject })
+        if prefix == Some(b'A') && ethertype == crate::packet::ETHERTYPE_ARP {
+            let (arp_sha, requester_ip, guest_ip) = arp_request(payload)?;
+            if arp_sha != hwaddr {
+                return None;
+            }
+            return Some(CopyEvent::ArpRequest {
+                guest_ip,
+                requester_ip,
+                requester_mac: hwaddr,
+            });
+        }
+        Some(CopyEvent::Nflog { hwaddr, dst_mac, ethertype, l3: payload.to_vec(), reinject: prefix == Some(b'R') })
     } else {
         if payload.len() < 14 {
             return None;
@@ -194,7 +207,7 @@ fn parse_packet(abody: &[u8]) -> Option<CopyEvent> {
         let dst_mac = Mac::from_slice(&payload[0..6])?;
         let hwaddr = Mac::from_slice(&payload[6..12])?;
         let ethertype = u16::from_be_bytes([payload[12], payload[13]]);
-        Some(CopyEvent::Nflog { hwaddr, dst_mac, ethertype, l3: payload[14..].to_vec(), reinject })
+        Some(CopyEvent::Nflog { hwaddr, dst_mac, ethertype, l3: payload[14..].to_vec(), reinject: prefix == Some(b'R') })
     }
 }
 

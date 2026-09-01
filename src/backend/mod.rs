@@ -37,7 +37,7 @@ pub(crate) fn push_copy(tx: &Sender<CopyEvent>, ev: CopyEvent, dropped: &mut u64
         Err(TrySendError::Full(_)) => {
             *dropped += 1;
             if dropped.is_power_of_two() {
-                log::warn!("copy queue full: {dropped} learn events dropped so far (lossy by design)");
+                log::warn!("copy queue full: {dropped} copy events dropped so far (lossy by design)");
             }
         }
     }
@@ -48,6 +48,13 @@ pub(crate) fn push_copy(tx: &Sender<CopyEvent>, ev: CopyEvent, dropped: &mut u64
 pub enum CopyEvent {
     /// ebpf: BPF already parsed the (ip, mac) tuple in-kernel.
     Learn { ip: IpAddr, mac: Mac },
+    /// An upstream ARP request for an address in the current kernel demux map. The
+    /// core validates it against its authoritative installed snapshot before replying.
+    ArpRequest {
+        guest_ip: std::net::Ipv4Addr,
+        requester_ip: std::net::Ipv4Addr,
+        requester_mac: Mac,
+    },
     /// nft NFLOG: raw L3 payload + L2 metadata; parsed in the core. `reinject`
     /// (ND drop path) means the core must fix_csum + AF_PACKET send to up0.
     Nflog {

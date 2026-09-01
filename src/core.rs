@@ -531,6 +531,11 @@ impl Core {
     async fn on_copy(&mut self, ev: CopyEvent) -> Result<()> {
         match ev {
             CopyEvent::Learn { ip, mac } => self.do_learn(ip, mac).await,
+            CopyEvent::ArpRequest {
+                guest_ip,
+                requester_ip,
+                requester_mac,
+            } => self.on_arp_request(guest_ip, requester_ip, requester_mac),
             CopyEvent::Nflog { hwaddr, dst_mac, ethertype, mut l3, reinject } => {
                 // Learn FIRST: with the entry already flashed into ip2mac, the reinjected
                 // ND hits the up0-egress discovery-dup rule as a *known* source and isn't
@@ -551,6 +556,26 @@ impl Core {
                 learned
             }
         }
+    }
+
+    /// Reply to an upstream request for an installed guest IPv4 address. The backend
+    /// filters for its current demux map; check `installed` again because this event
+    /// crosses an asynchronous, lossy queue and may arrive after withdrawal.
+    fn on_arp_request(
+        &self,
+        guest_ip: Ipv4Addr,
+        requester_ip: Ipv4Addr,
+        requester_mac: Mac,
+    ) -> Result<()> {
+        if !self.installed.contains_key(&IpAddr::V4(guest_ip)) {
+            return Ok(());
+        }
+        let (Some(inj), Some(hostmac)) = (&self.injector, self.snap.hostmac) else {
+            return Ok(());
+        };
+        inj.send_frame(&build_arp_reply(guest_ip, hostmac, requester_ip, requester_mac))?;
+        log::debug!("arp-proxy: {guest_ip} is-at {hostmac} -> {requester_ip} ({requester_mac})");
+        Ok(())
     }
 
     async fn do_learn(&mut self, ip: IpAddr, mac: Mac) -> Result<()> {

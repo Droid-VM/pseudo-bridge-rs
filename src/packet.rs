@@ -40,6 +40,31 @@ pub fn arp_spa(l3: &[u8]) -> Option<Ipv4Addr> {
     }
 }
 
+/// Parse an Ethernet/IPv4 ARP request. The caller supplies the Ethernet source
+/// separately; `arp_sha` is returned so it can reject inconsistent L2/L3 senders.
+pub fn arp_request(l3: &[u8]) -> Option<(Mac, Ipv4Addr, Ipv4Addr)> {
+    if l3.len() < 28
+        || be16(l3, 0)? != 1
+        || be16(l3, 2)? != ETHERTYPE_IPV4
+        || l3.get(4..6)? != [6, 4]
+        || be16(l3, 6)? != 1
+    {
+        return None;
+    }
+    let sha = Mac::from_slice(l3.get(8..14)?)?;
+    let spa = l3.get(14..18)?;
+    let tpa = l3.get(24..28)?;
+    let requester_ip = Ipv4Addr::new(spa[0], spa[1], spa[2], spa[3]);
+    if requester_ip.is_unspecified() {
+        return None;
+    }
+    Some((
+        sha,
+        requester_ip,
+        Ipv4Addr::new(tpa[0], tpa[1], tpa[2], tpa[3]),
+    ))
+}
+
 /// IPv6 next header byte and source/destination addresses from an L3 IPv6 packet.
 pub fn ipv6_src(l3: &[u8]) -> Option<Ipv6Addr> {
     let s = l3.get(8..24)?;
@@ -184,6 +209,28 @@ mod tests {
         assert_eq!(arp_spa(&p), Some(Ipv4Addr::new(10, 0, 0, 5)));
         p[14..18].copy_from_slice(&[0, 0, 0, 0]);
         assert_eq!(arp_spa(&p), None, "probe spa=0");
+    }
+
+    #[test]
+    fn arp_request_parse_rejects_probes() {
+        let mut p = vec![0u8; 28];
+        p[1] = 1; // htype ethernet
+        p[2..4].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+        p[4..6].copy_from_slice(&[6, 4]);
+        p[6..8].copy_from_slice(&1u16.to_be_bytes());
+        p[8..14].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
+        p[14..18].copy_from_slice(&[10, 0, 0, 1]);
+        p[24..28].copy_from_slice(&[10, 0, 0, 5]);
+        assert_eq!(
+            arp_request(&p),
+            Some((
+                Mac([2, 0, 0, 0, 0, 1]),
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(10, 0, 0, 5),
+            ))
+        );
+        p[14..18].copy_from_slice(&[0; 4]);
+        assert_eq!(arp_request(&p), None, "ACD probe has no requester IP");
     }
 
     fn mk_ns(src_unspec: bool, target: [u8; 16]) -> Vec<u8> {

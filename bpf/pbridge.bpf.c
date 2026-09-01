@@ -29,7 +29,7 @@ struct cfg {
 };
 struct in6 { __u8 a[16]; };
 struct mac { __u8 a[6]; };
-struct copy_evt { __u8 mac[6]; __u8 fam; __u8 _pad; __u8 ip[16]; };
+struct copy_evt { __u8 mac[6]; __u8 kind; __u8 fam; __u8 ip[16]; };
 
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
     __type(key, __u32); __type(value, struct cfg); } config __attribute__((section(".maps"), used));
@@ -87,13 +87,24 @@ static __always_inline int mac_eq(const __u8 *a, const __u8 *b) {
 static __always_inline void mark_seen4(__u32 ip) { __u8 one = 1; bpf_map_update_elem(&seen4, &ip, &one, 0); }
 static __always_inline void mark_seen6(struct in6 *ip) { __u8 one = 1; bpf_map_update_elem(&seen6, ip, &one, 0); }
 static __always_inline void learn4(__u32 ip, const __u8 *mac) {
-    struct copy_evt ev = {}; for (int i=0;i<6;i++) ev.mac[i]=mac[i]; ev.fam=4;
+    struct copy_evt ev = {}; for (int i=0;i<6;i++) ev.mac[i]=mac[i]; ev.kind=0; ev.fam=4;
     __builtin_memcpy(ev.ip, &ip, 4);
     bpf_ringbuf_output(&events, &ev, sizeof(ev), 0);
 }
 static __always_inline void learn6(struct in6 *ip, const __u8 *mac) {
-    struct copy_evt ev = {}; for (int i=0;i<6;i++) ev.mac[i]=mac[i]; ev.fam=6;
+    struct copy_evt ev = {}; for (int i=0;i<6;i++) ev.mac[i]=mac[i]; ev.kind=0; ev.fam=6;
     for (int i=0;i<16;i++) ev.ip[i]=ip->a[i];
+    bpf_ringbuf_output(&events, &ev, sizeof(ev), 0);
+}
+// Upstream ARP request for an installed guest. ip[0..4] is the target guest IP,
+// ip[4..8] is the requester IP. Keep the original request flowing as a fallback.
+static __always_inline void arp_request4(__u32 target, __u32 requester, const __u8 *mac) {
+    if (!requester || !bpf_map_lookup_elem(&ip2mac4, &target)) return;
+    struct copy_evt ev = {};
+    for (int i = 0; i < 6; i++) ev.mac[i] = mac[i];
+    ev.kind = 1; ev.fam = 4;
+    __builtin_memcpy(&ev.ip[0], &target, 4);
+    __builtin_memcpy(&ev.ip[4], &requester, 4);
     bpf_ringbuf_output(&events, &ev, sizeof(ev), 0);
 }
 static __always_inline int is_unspec16(const struct in6 *a) {
@@ -249,6 +260,15 @@ static __always_inline int in_common(struct __sk_buff *skb, int is_direct) {
     if (proto == hs(ETH_P_ARP)) {
         __u32 tpa; bpf_skb_load_bytes(skb, O_ARP_TPA, &tpa, 4);
         if (bpf_map_lookup_elem(&host4, &tpa)) return TC_ACT_OK;
+        __u16 op = 0;
+        bpf_skb_load_bytes(skb, O_ARP_OP, &op, 2);
+        if (op == hs(1)) {
+            __u8 sha[6];
+            __u32 spa = 0;
+            bpf_skb_load_bytes(skb, O_ARP_SHA, sha, 6);
+            bpf_skb_load_bytes(skb, O_ARP_SPA, &spa, 4);
+            if (mac_eq(sha, src)) arp_request4(tpa, spa, src);
+        }
     }
     if (proto == hs(ETH_P_IPV6) && dst_is_host) {
         struct in6 ip; bpf_skb_load_bytes(skb, O_V6_DST, &ip, 16);

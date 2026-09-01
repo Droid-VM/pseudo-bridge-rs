@@ -23,8 +23,9 @@ MAC.
   choice per environment. Userspace is a small Rust control plane: it *learns*
   guest `ip → mac` bindings from a lossy copy path (NFLOG / BPF ringbuf), enforces
   per-MAC/global caps with FIFO eviction, ages idle entries, and reconciles state into
-  the kernel. Data packets never enter userspace (one exception: nft can't fix ICMPv6
-  checksums, so ND packets take a fix-and-reinject detour).
+  the kernel. Data packets never enter userspace (exceptions are control traffic: nft
+  can't fix ICMPv6 checksums, so ND packets take a fix-and-reinject detour; an ARP
+  request for a known guest may receive a userspace proxy reply).
 - **No shell-outs, ever.** No `ip`, `nft`, `tc`, `brctl`, `bpftool`. Everything is
   netlink (rtnetlink + hand-rolled nf_tables wire) and BPF syscalls (aya). This is what
   makes it work on Android, where none of those binaries are guaranteed.
@@ -32,6 +33,7 @@ MAC.
   The BPF object is architecture-independent and embedded in both.
 
 Full design — every rule table, state machine, and tradeoff: **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+Chinese Android real-device test record: **[ANDROID_REAL_DEVICE_TEST.md](ANDROID_REAL_DEVICE_TEST.md)**.
 
 ## Engines × modes
 
@@ -103,6 +105,12 @@ re-initializes when it comes back.
    ARP reply per guest (unicast replies assert `NUD_REACHABLE` on Linux; GARP alone
    only gets STALE) plus an occasional GARP. Peers then never need to ARP-request a
    guest at all — at a tiny fraction of the power cost of disabling powersave.
+
+When an ARP request for an already learned guest reaches `up0`, pbridge also emits an
+immediate unicast proxy reply (`guest-IP is-at HOSTMAC`). The original request remains
+on the existing path toward the guest, so a guest reply is harmlessly additive.
+Requests with `spa=0.0.0.0` (ACD probes) are ignored. If APF/firmware drops the request
+before `up0`, software cannot observe it; keep `--arp-keepalive 10` for that case.
 
 ## Tests
 

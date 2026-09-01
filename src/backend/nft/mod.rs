@@ -184,7 +184,7 @@ impl NftBackend {
                 for r in out_rules_fwd(hostmac, brmac, group, up0) {
                     rules.push((CH_OUT, r));
                 }
-                for r in in_rules_fwd(hostmac, fwd0) {
+                for r in in_rules_fwd(hostmac, fwd0, group) {
                     rules.push((CH_IN, r));
                 }
             }
@@ -192,7 +192,7 @@ impl NftBackend {
                 for r in out_rules_direct(hostmac, group) {
                     rules.push((CH_OUT, r));
                 }
-                for r in in_rules_direct(hostmac) {
+                for r in in_rules_direct(hostmac, group) {
                     rules.push((CH_IN, r));
                 }
             }
@@ -700,7 +700,20 @@ fn in_demux_arp(hostmac: Mac, term: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     r
 }
 
-fn in_rules_fwd(hostmac: Mac, fwd0: u32) -> Vec<Vec<Vec<u8>>> {
+fn in_arp_proxy_request(group: u16) -> Vec<Vec<u8>> {
+    // Report only requests whose target has an installed demux entry. The original
+    // request keeps flowing (and may still reach the guest); the userspace reply is
+    // an additional fast proxy answer, not a new dependency on NFLOG delivery.
+    let mut r = eth_gate(ETH_ARP);
+    r.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, ARP_OP, 2, NFT_REG_1));
+    r.push(cmp(NFT_REG_1, NFT_CMP_EQ, &1u16.to_be_bytes()));
+    r.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, ARP_TPA, 4, NFT_REG_1));
+    r.push(lookup("ip2mac4", SID_IP2MAC4, NFT_REG_1, None));
+    r.push(log(group, "A"));
+    r
+}
+
+fn in_rules_fwd(hostmac: Mac, fwd0: u32, group: u16) -> Vec<Vec<Vec<u8>>> {
     // Reflected self-frame guard FIRST: a Wi-Fi AP echoes the STA's own transmissions
     // back down (broadcasts at the next DTIM, unicast-to-own-mac via hairpin). Anything
     // arriving with src == HOSTMAC is such a copy; the bcast/mcast dup below would
@@ -709,6 +722,7 @@ fn in_rules_fwd(hostmac: Mac, fwd0: u32) -> Vec<Vec<Vec<u8>>> {
     // the demux would hand hairpinned replies back to guests. Drop them outright.
     let mut rules = vec![drop_src(hostmac)];
     rules.extend(in_host_rules(hostmac));
+    rules.push(in_arp_proxy_request(group));
     // bcast/mcast dup
     rules.push({
         let mut r = vec![meta_load(NFT_META_PKTTYPE_KEY, NFT_REG_1), cmp(NFT_REG_1, NFT_CMP_EQ, &[PKT_BROADCAST])];
@@ -732,11 +746,12 @@ fn in_rules_fwd(hostmac: Mac, fwd0: u32) -> Vec<Vec<Vec<u8>>> {
     rules
 }
 
-fn in_rules_direct(hostmac: Mac) -> Vec<Vec<Vec<u8>>> {
+fn in_rules_direct(hostmac: Mac, group: u16) -> Vec<Vec<Vec<u8>>> {
     // same reflected self-frame guard as fwd (see in_rules_fwd) — in direct mode the
     // echoed copy would otherwise be flooded by the kernel bridge into the guest ports.
     let mut rules = vec![drop_src(hostmac)];
     rules.extend(in_host_rules(hostmac));
+    rules.push(in_arp_proxy_request(group));
     rules.push(in_demux_ip(Family::V4, hostmac, term_accept()));
     rules.push(in_demux_ip(Family::V6, hostmac, term_accept()));
     rules.push(in_demux_arp(hostmac, term_accept()));

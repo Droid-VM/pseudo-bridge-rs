@@ -367,6 +367,24 @@ evict_oldest(fam, scope_mac) -> ip:              # FIFO:createat 最小者
 
 DHCP 不進 userspace(kernel 已 set flag + udp.csum 0);in demux / multicast 全 in-kernel。copy lossy(掉了下個封包再學;nft-ND 掉了該 ND 丟,guest 會重試)。`syncer.notify(ip)` 只是「這個 ip 動了去 reconcile」,寫不寫 kernel / 衝突跳過全由 syncer 判。
 
+### 入向 ARP proxy reply
+
+刪除 guest `/32` 的 `local` route 後, Linux 不再替 guest 位址回答 ARP。保持該路由設計
+(host→guest 仍靠 vmroute),但在 up0 ingress 對已安裝 guest 的 ARP request 增加控制面回覆:
+
+```
+if ethertype == ARP && op == request && spa != 0.0.0.0 && tpa ∈ ip2mac4:
+    send(up0, arp_reply(spa=tpa, sha=HOSTMAC, tpa=spa, tha=eth.src))
+```
+
+ebpf 在 ingress map lookup 後經 ringbuf 傳送 `{guest_ip, requester_ip, requester_mac}`;
+nft 用一條 `NFLOG prefix "A"` 規則做相同的 target-map 過濾。Rust 收到事件後再次檢查
+`installed`(事件可能在撤銷後才離開 lossy queue),再以既有 AF_PACKET injector 單播回覆。
+原 ARP request 不被 drop,仍照既有 broadcast/bridge 路徑送往 guest;因此 guest 自己回覆時
+只是重複同一正確 mapping。`src == HOSTMAC` 的 ingress 反射 guard 會丟棄 AP hairpin
+回來的 proxy reply。若 APF/firmware 在 up0 之前丟掉 ARP,軟體看不到該 request,仍需
+`--arp-keepalive 10` 避免上游重新發起解析。
+
 ### host → VM 路由
 
     用途:只有「host 自己主動連 VM、且 host↔VM 不在同一 L2 段」才需要。外部↔VM 全是純 L2 / offload,不碰路由。

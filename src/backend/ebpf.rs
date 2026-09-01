@@ -339,27 +339,68 @@ fn spawn_ringbuf_reader(mut ring: RingBuf<MapData>, stop: Arc<AtomicBool>, tx: S
                 }
                 while let Some(item) = ring.next() {
                     let d: &[u8] = &item;
-                    if d.len() < 24 {
+                    let Some(ev) = parse_ring_event(d) else {
                         continue;
-                    }
-                    let Some(mac) = Mac::from_slice(&d[0..6]) else { continue };
-                    let fam = d[6];
-                    let ip = if fam == 4 {
-                        IpAddr::V4(Ipv4Addr::new(d[8], d[9], d[10], d[11]))
-                    } else {
-                        let mut b = [0u8; 16];
-                        b.copy_from_slice(&d[8..24]);
-                        IpAddr::V6(Ipv6Addr::from(b))
                     };
-                    push_copy(&tx, CopyEvent::Learn { ip, mac }, &mut dropped);
+                    push_copy(&tx, ev, &mut dropped);
                 }
             }
         })
         .expect("spawn ringbuf reader");
 }
 
+fn parse_ring_event(d: &[u8]) -> Option<CopyEvent> {
+    if d.len() < 24 {
+        return None;
+    }
+    let mac = Mac::from_slice(&d[0..6])?;
+    match (d[6], d[7]) {
+        (0, 4) => Some(CopyEvent::Learn {
+            ip: IpAddr::V4(Ipv4Addr::new(d[8], d[9], d[10], d[11])),
+            mac,
+        }),
+        (0, 6) => {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&d[8..24]);
+            Some(CopyEvent::Learn {
+                ip: IpAddr::V6(Ipv6Addr::from(b)),
+                mac,
+            })
+        }
+        (1, 4) => Some(CopyEvent::ArpRequest {
+            guest_ip: Ipv4Addr::new(d[8], d[9], d[10], d[11]),
+            requester_ip: Ipv4Addr::new(d[12], d[13], d[14], d[15]),
+            requester_mac: mac,
+        }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod parse_test {
+    use crate::backend::CopyEvent;
+    use crate::types::Mac;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn arp_request_ring_event() {
+        let d = [
+            2, 0, 0, 0, 0, 1, 1, 4, 10, 0, 0, 5, 10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        match super::parse_ring_event(&d) {
+            Some(CopyEvent::ArpRequest {
+                guest_ip,
+                requester_ip,
+                requester_mac,
+            }) => {
+                assert_eq!(guest_ip, Ipv4Addr::new(10, 0, 0, 5));
+                assert_eq!(requester_ip, Ipv4Addr::new(10, 0, 0, 1));
+                assert_eq!(requester_mac, Mac([2, 0, 0, 0, 0, 1]));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
     #[test]
     fn bpf_obj_parses() {
         // Full load creates maps (needs bpf() permission), so accept a syscall-level
