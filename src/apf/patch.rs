@@ -27,12 +27,14 @@ const JEQ_BYTES: usize = 9;
 /// Xiaomi vendor counter for the ICMP echo drop (`DROPPED_ICMP_ECHO`).
 const ICMP_DROP_COUNTER: u32 = 21;
 const OFF_V4_PROTO: u32 = 23;
+const OFF_V4_ARP_TPA: u32 = 38;
 const OFF_V4_DST: u32 = 30;
 const OFF_ICMP_TYPE: u32 = 34;
 const PROTO_ICMP: u32 = 1;
 const ICMP_ECHO_REQUEST: u32 = 8;
 
 #[derive(Debug)]
+#[allow(dead_code)] // ICMP-only compatibility plan uses this; watchdog's ARP-aware plan rewrites its own patch.
 pub enum Plan {
     /// The live program already carries exactly these rules; writing would be a no-op.
     AlreadyPatched,
@@ -40,19 +42,15 @@ pub enum Plan {
     Patch(Vec<u8>),
 }
 
-/// Decide what to do with the live program. `debugbuf_size` comes from the layout
-/// derivation and is cross-checked here against the program's own debugbuf instruction.
+/// Original ICMP-only patch plan, retained for compatibility fixtures and callers that do
+/// not opt into ARP workarounds.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn plan(prog: &[u8], debugbuf_size: usize, guests: &[Ipv4Addr]) -> Result<Plan> {
     let insns = parse(prog)?;
     if let Some(found) = find_our_rules(prog, &insns)? {
         if found == guests {
             return Ok(Plan::AlreadyPatched);
         }
-        // This is our byte-identical insertion, so it can be safely removed back to the
-        // stock layout before applying the new DHCP-derived set. Unlike an arbitrary
-        // patched program, we know its exact instruction bytes and can invert every jump
-        // and debugbuf adjustment. This lets a DHCP lease change replace the APF allow-list
-        // without waiting for NetworkStack to happen to reinstall stock first.
         let stock = remove_our_rules(prog, &insns, &found)?;
         let stock_insns = parse(&stock)?;
         let stock_dbg = debugbuf_size_of(&stock, &stock_insns)?;
@@ -73,6 +71,97 @@ pub fn plan(prog: &[u8], debugbuf_size: usize, guests: &[Ipv4Addr]) -> Result<Pl
         debugbuf_size,
         guests,
     )?))
+}
+
+/// ICMP plus destination-specific ARP patch. Used by pbridge's normal APF watchdog so
+/// guest v4 `/32` addresses no longer need to be assigned to wlan0.
+pub fn plan_with_arp(prog: &[u8], debugbuf_size: usize, guests: &[Ipv4Addr]) -> Result<Plan> {
+    let insns = parse(prog)?;
+    let (stock, stock_insns, stock_dbg) = if let Some(found) = find_our_rules(prog, &insns)? {
+        let stock = remove_our_rules(prog, &insns, &found)?;
+        let parsed = parse(&stock)?;
+        let dbg = debugbuf_size_of(&stock, &parsed)?;
+        (stock, parsed, dbg)
+    } else {
+        (prog.to_vec(), insns, debugbuf_size)
+    };
+    plan_stock(&stock, &stock_insns, stock_dbg, guests)
+}
+
+fn plan_stock(
+    prog: &[u8],
+    insns: &[Insn],
+    debugbuf_size: usize,
+    guests: &[Ipv4Addr],
+) -> Result<Plan> {
+    // With guest /32 proxies removed, NetworkStack normally emits the vendor ARP
+    // "other host" drop (counter 26), which we patch precisely by TPA. Some historical
+    // programs (including the old proxy-address layout) already pass ARP and have no
+    // such site; preserve their proven ICMP-only patch shape instead of failing.
+    let (arp_patched, arp_insns, arp_dbg) = match find_arp_drop_site(insns) {
+        Ok(arp_at) => {
+            // The ARP jeqs target the final program PASS. They are inserted before the
+            // ICMP insertion, so account for BOTH deltas now; `apply()` will then shift
+            // their crossing jump offsets when it inserts the ICMP block later.
+            let total_delta = JEQ_BYTES * guests.len() + LDW_BYTES + JEQ_BYTES * guests.len();
+            let arp = arp_insertion_bytes(arp_at, prog.len() + total_delta, guests);
+            let patched = splice(prog, insns, arp_at, &arp, debugbuf_size)?;
+            let parsed = parse(&patched)?;
+            let dbg = debugbuf_size_of(&patched, &parsed)?;
+            (patched, parsed, dbg)
+        }
+        Err(e)
+            if e.to_string()
+                .starts_with("no vendor ARP non-local drop site") =>
+        {
+            (prog.to_vec(), insns.to_vec(), debugbuf_size)
+        }
+        Err(e) => return Err(e),
+    };
+    let icmp_at = find_icmp_drop_site(&arp_patched, &arp_insns)?;
+    Ok(Plan::Patch(apply(
+        &arp_patched,
+        &arp_insns,
+        icmp_at,
+        arp_dbg,
+        guests,
+    )?))
+}
+
+fn find_arp_drop_site(insns: &[Insn]) -> Result<usize> {
+    let sites: Vec<usize> = insns
+        .windows(3)
+        .filter_map(|w| {
+            let (load, jne, drop) = (&w[0], &w[1], &w[2]);
+            (load.opcode == LDW
+                && load.reg == 0
+                && load.imm == OFF_V4_ARP_TPA
+                && jne.opcode == JNE
+                && jne.reg == 0
+                && jne.imm_len > 0
+                && drop.opcode == PASSDROP
+                && drop.reg == 1
+                && drop.imm == 26)
+                .then_some(drop.start)
+        })
+        .collect();
+    match sites.as_slice() {
+        [site] => Ok(*site),
+        [] => bail!("no vendor ARP non-local drop site (ldw[38]/jne/drop counter=26)"),
+        _ => bail!("{} candidate vendor ARP non-local drop sites", sites.len()),
+    }
+}
+
+fn arp_insertion_bytes(insert_at: usize, final_len: usize, guests: &[Ipv4Addr]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(JEQ_BYTES * guests.len());
+    for (k, ip) in guests.iter().enumerate() {
+        let end = insert_at + JEQ_BYTES * (k + 1);
+        let off = (final_len - end) as u32;
+        out.push((JEQ << 3) | (3 << 1));
+        out.extend_from_slice(&off.to_be_bytes());
+        out.extend_from_slice(&ip.octets());
+    }
+    out
 }
 
 /// Locate the vendor sequence `ldb r0,[23] / jne r0,1 / ldb r0,[34] / jne r0,8 / drop 21`
@@ -205,6 +294,76 @@ fn remove_our_rules(prog: &[u8], insns: &[Insn], guests: &[Ipv4Addr]) -> Result<
 
     // Invert insertion's crossing-jump adjustment. These jump fields are before `start`,
     // so their byte offsets do not move when the insertion disappears.
+    for i in insns {
+        let Some(target) = i.target else { continue };
+        if i.end <= start && target >= end {
+            if i.imm < delta as u32 {
+                bail!(
+                    "pbridge jump at byte {} underflows while removing prior insertion",
+                    i.start
+                );
+            }
+            let new = i.imm - delta as u32;
+            let at = i.jump_imm_at.expect("jump target has immediate");
+            out[at..at + i.jump_imm_len].copy_from_slice(&new.to_be_bytes()[4 - i.jump_imm_len..]);
+        }
+    }
+    let dbg = debugbuf_size_of(prog, insns)?;
+    let dbg_insn = insns
+        .iter()
+        .find(|i| i.opcode == EXT && i.imm == EXCEPTIONBUFFER_EXT)
+        .ok_or_else(|| anyhow::anyhow!("missing debugbuf"))?;
+    if dbg_insn.end > start || dbg + delta > u16::MAX as usize {
+        bail!("invalid debugbuf while removing prior pbridge insertion");
+    }
+    let at = dbg_insn.end - 2;
+    out[at..at + 2].copy_from_slice(&((dbg + delta) as u16).to_be_bytes());
+    let parsed = parse(&out)?;
+    if parsed.last().is_none_or(|i| i.end != out.len()) {
+        bail!("APF after removing ICMP rules does not walk to its own end");
+    }
+    remove_arp_rules(&out, &parsed, guests).or(Ok(out))
+}
+
+fn remove_arp_rules(prog: &[u8], insns: &[Insn], guests: &[Ipv4Addr]) -> Result<Vec<u8>> {
+    let pass = prog.len();
+    let mut range = None;
+    for (k, drop) in insns.iter().enumerate() {
+        if drop.opcode != PASSDROP || drop.reg != 1 || drop.imm != 26 {
+            continue;
+        }
+        let mut j = k;
+        let mut ips = Vec::new();
+        while j > 0 {
+            let cand = &insns[j - 1];
+            if cand.opcode == JEQ && cand.reg == 0 && cand.imm_len == 4 && cand.target == Some(pass)
+            {
+                let Some(ip) = cmp_imm(prog, cand).map(Ipv4Addr::from) else {
+                    break;
+                };
+                ips.push(ip);
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+        ips.reverse();
+        if ips == guests {
+            range = Some((insns[j].start, drop.start));
+            break;
+        }
+    }
+    let Some((start, end)) = range else {
+        bail!("cannot locate the byte-identical pbridge ARP insertion to replace");
+    };
+    remove_insertion(prog, insns, start, end)
+}
+
+fn remove_insertion(prog: &[u8], insns: &[Insn], start: usize, end: usize) -> Result<Vec<u8>> {
+    let delta = end - start;
+    let mut out = Vec::with_capacity(prog.len() - delta);
+    out.extend_from_slice(&prog[..start]);
+    out.extend_from_slice(&prog[end..]);
     for i in insns {
         let Some(target) = i.target else { continue };
         if i.end <= start && target >= end {

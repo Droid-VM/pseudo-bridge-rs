@@ -1027,12 +1027,16 @@ impl Core {
     // ---- offload workaround: install learned guest addrs on up0 (fwd, APF) ----
 
     /// Whether `ip`'s family is selected by the effective offload config (see `offload_cfg`).
+    /// The APF watchdog handles guest IPv4 ARP directly in firmware, so never make a
+    /// guest v4 `/32` a local wlan0 address. Keeping only the real host v4 prevents
+    /// NetworkStack from changing its ARP program merely because pbridge learned guests.
+    /// IPv6 still needs the existing local-address NS workaround and remains proxied.
     fn offload_family_selected(&self, ip: IpAddr) -> bool {
         let Some(f) = self.offload_cfg() else {
             return false;
         };
         match ip {
-            IpAddr::V4(_) => f.v4,
+            IpAddr::V4(_) => false,
             IpAddr::V6(_) if is_link_local(&ip) => f.v6ll,
             IpAddr::V6(_) => f.v6,
         }

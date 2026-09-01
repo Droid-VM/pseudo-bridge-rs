@@ -94,7 +94,7 @@ fn disabled_window(sock: &mut VendorSocket, ifindex: u32, guests: &[Ipv4Addr]) -
     let layout = ProgramLayout::derive(&work).context("apf: cannot trust live program layout")?;
     let stock = &work[..layout.program_len];
 
-    let patched = match patch::plan(stock, layout.debugbuf_size, guests)? {
+    let patched = match patch::plan_with_arp(stock, layout.debugbuf_size, guests)? {
         patch::Plan::AlreadyPatched => {
             return Ok(Outcome::AlreadyPatched {
                 len: layout.program_len,
