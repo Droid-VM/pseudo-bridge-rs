@@ -11,7 +11,7 @@ use crate::apf::{self, VendorSocket};
 use crate::backend::{
     ApfExternalWrite, Backend, CopyEvent, InitCfg, APF_QUEUE_DEPTH, COPY_QUEUE_DEPTH,
 };
-use crate::cli::{Cli, Engine, Mode};
+use crate::cli::{ApfWatchdogMode, Cli, Engine, Mode};
 use crate::netlink::{AddrInfo, Net};
 use crate::packet::{build_frame, classify_learn, fix_icmpv6_csum, ETHERTYPE_IPV6};
 use crate::state::Entries;
@@ -81,7 +81,13 @@ pub struct Core {
 /// APF watchdog state. Present iff `--apf-watchdog-guest` was given; the vendor socket is
 /// opened lazily at session init (it needs the driver loaded) and dropped at teardown.
 struct ApfWatchdog {
-    guests: Vec<Ipv4Addr>,
+    mode: ApfWatchdogMode,
+    /// Current automatic DHCP leases keyed by client MAC. A DHCPACK replacing a MAC's
+    /// lease removes its old IPv4 from the APF set immediately.
+    dhcp_leases: HashMap<Mac, Ipv4Addr>,
+    /// DHCP client DISCOVER/REQUESTs observed from the guest side. A matching ACK must
+    /// arrive within this window before it is allowed to expand automatic APF access.
+    dhcp_pending: HashMap<Mac, std::time::Instant>,
     sock: Option<VendorSocket>,
     ifindex: u32,
     /// Consecutive failures, for the retry backoff.
@@ -98,6 +104,7 @@ const APF_BACKOFF_SECS: [u64; 5] = [1, 2, 5, 10, 30];
 /// then back off to avoid waking a missing VM forever.
 const APF_DISCOVERY_FAST_TICKS: u64 = 5;
 const APF_DISCOVERY_SLOW_EVERY: u64 = 30;
+const DHCP_ACK_WINDOW: Duration = Duration::from_secs(30);
 
 fn apf_discovery_due(tick: u64) -> bool {
     tick <= APF_DISCOVERY_FAST_TICKS || tick.is_multiple_of(APF_DISCOVERY_SLOW_EVERY)
@@ -109,7 +116,8 @@ const GARP_EVERY: u64 = 3;
 
 pub async fn run(cli: Cli) -> Result<()> {
     // Reject an unsupported combination before touching the kernel.
-    let apf_guests = crate::cli::validate_apf_watchdog(&cli).map_err(|e| anyhow!(e))?;
+    let apf_mode = crate::cli::validate_apf_watchdog(&cli).map_err(|e| anyhow!(e))?;
+    let apf_enabled_cfg = !matches!(apf_mode, ApfWatchdogMode::Off);
 
     let net = Net::connect()?;
     let mut nl_rx = Net::monitor()?;
@@ -119,7 +127,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     // Depth-1, coalescing, NOT lossy (see ApfExternalWrite). Only created when the
     // watchdog is on, so the ebpf session is otherwise unchanged.
     let (apf_tx_raw, mut apf_rx) = channel::<ApfExternalWrite>(APF_QUEUE_DEPTH);
-    let apf_tx = (!apf_guests.is_empty()).then_some(apf_tx_raw);
+    let apf_tx = apf_enabled_cfg.then_some(apf_tx_raw);
 
     let backend: Box<dyn Backend> = match cli.engine {
         Engine::Nft => Box::new(crate::backend::nft::NftBackend::new()),
@@ -148,19 +156,20 @@ pub async fn run(cli: Cli) -> Result<()> {
         aging_tick: 0,
         skip_flush_once: false,
         keepalive_tick: 0,
-        apf: (!apf_guests.is_empty()).then(|| ApfWatchdog {
-            guests: apf_guests.clone(),
+        apf: apf_enabled_cfg.then(|| ApfWatchdog {
+            mode: apf_mode.clone(),
+            dhcp_leases: HashMap::new(),
+            dhcp_pending: HashMap::new(),
             sock: None,
             ifindex: 0,
             failures: 0,
         }),
         apf_discovery_ticks: 0,
     };
-    if !apf_guests.is_empty() {
+    if apf_enabled_cfg {
         log::info!(
-            "apf-watchdog: enabled for {} guest(s) {:?}, debounce {}ms",
-            apf_guests.len(),
-            apf_guests,
+            "apf-watchdog: enabled in {:?} mode, debounce {}ms",
+            apf_mode,
             core.cli.apf_watchdog_debounce_ms
         );
     }
@@ -692,12 +701,35 @@ impl Core {
         }
     }
 
+    /// The active APF PASS list. Fixed mode is static; DHCP mode uses only observed ACK
+    /// leases, sorted for deterministic bytecode/readback. `None` means no lease yet.
+    fn apf_guests(&self) -> Option<Vec<Ipv4Addr>> {
+        let wd = self.apf.as_ref()?;
+        match &wd.mode {
+            ApfWatchdogMode::Fixed(guests) => Some(guests.clone()),
+            ApfWatchdogMode::Dhcp if !wd.dhcp_leases.is_empty() => {
+                let mut leases: Vec<Ipv4Addr> = wd.dhcp_leases.values().copied().collect();
+                leases.sort_unstable();
+                leases.dedup();
+                Some(leases)
+            }
+            ApfWatchdogMode::Off | ApfWatchdogMode::Dhcp => None,
+        }
+    }
+
     /// Run one repatch transaction. Returns the backoff to wait before retrying, or None
     /// when there is nothing to retry.
     async fn apf_repatch(&mut self, reason: &str) -> Option<Duration> {
         if !self.initialized {
             return None;
         }
+        let guests = self.apf_guests();
+        let Some(guests) = guests else {
+            // DHCP auto mode has no observed lease yet. Do not disable/read/write APF or
+            // install an empty patch; the first validated DHCPACK queues the first patch.
+            log::debug!("apf-watchdog: {reason}: waiting for a DHCPACK lease");
+            return None;
+        };
         let Some(wd) = &mut self.apf else { return None };
         let (Some(sock), ifindex) = (wd.sock.as_mut(), wd.ifindex) else {
             return None;
@@ -705,7 +737,6 @@ impl Core {
         if ifindex == 0 {
             return None;
         }
-        let guests = wd.guests.clone();
         // Blocking, but bounded: the four vendor commands measured ~42 ms total on device,
         // and the socket has a 2s recv timeout. Running it inline keeps the core actor the
         // single writer — no lock, no concurrent transaction, no half-applied program.
@@ -745,17 +776,16 @@ impl Core {
         }
     }
 
-    /// Cold-start discovery for explicit `--apf-watchdog-guest` IPv4s. It uses the same
-    /// anonymous RFC 5227 ARP probe as aging (`spa=0.0.0.0`, L2 broadcast): this asks a
-    /// live guest to defend its address, and the guest's real ARP reply passes through the
-    /// normal OUT hook to establish the authoritative `(IP, MAC)` binding. We never insert
-    /// a static/guessed MAC into `ip2mac`, and we never scan addresses the operator did not
-    /// explicitly name.
+    /// Cold-start discovery only applies to the fixed allow-list: DHCP auto mode has no
+    /// trusted IPv4 before an ACK, so probing a guessed lease would be a subnet scan.
     fn probe_apf_watchdog_guests(&self) -> Result<usize> {
         if !self.initialized {
             return Ok(0);
         }
         let Some(wd) = &self.apf else { return Ok(0) };
+        let ApfWatchdogMode::Fixed(guests) = &wd.mode else {
+            return Ok(0);
+        };
         let Some(inj) = &self.probe_injector else {
             return Ok(0);
         };
@@ -763,7 +793,7 @@ impl Core {
             return Ok(0);
         };
         let mut sent = 0;
-        for guest in &wd.guests {
+        for guest in guests {
             if self.entries.get(&IpAddr::V4(*guest)).is_some() {
                 continue;
             }
@@ -814,7 +844,18 @@ impl Core {
                 requester_ip,
                 requester_mac,
             } => self.on_arp_request(guest_ip, requester_ip, requester_mac),
-            CopyEvent::Nflog { hwaddr, dst_mac, ethertype, mut l3, reinject } => {
+            CopyEvent::DhcpAck {
+                lease_ip,
+                client_mac,
+            } => self.on_dhcp_ack(lease_ip, client_mac).await,
+            CopyEvent::DhcpRequest { client_mac } => self.on_dhcp_request(client_mac),
+            CopyEvent::Nflog {
+                hwaddr,
+                dst_mac,
+                ethertype,
+                mut l3,
+                reinject,
+            } => {
                 // Learn FIRST: with the entry already flashed into ip2mac, the reinjected
                 // ND hits the up0-egress discovery-dup rule as a *known* source and isn't
                 // echoed back into the vm bridge (the dedup there is an ip2mac lookup).
@@ -853,6 +894,62 @@ impl Core {
         };
         inj.send_frame(&build_arp_reply(guest_ip, hostmac, requester_ip, requester_mac))?;
         log::debug!("arp-proxy: {guest_ip} is-at {hostmac} -> {requester_ip} ({requester_mac})");
+        Ok(())
+    }
+
+    /// Record a guest-side DHCP DISCOVER/REQUEST. The matching server ACK must be recent
+    /// before automatic mode accepts its lease, preventing unrelated WLAN DHCP broadcasts
+    /// from widening the APF pass-list.
+    fn on_dhcp_request(&mut self, client_mac: Mac) -> Result<()> {
+        let Some(wd) = &mut self.apf else {
+            return Ok(());
+        };
+        if matches!(wd.mode, ApfWatchdogMode::Dhcp) {
+            wd.dhcp_pending
+                .insert(client_mac, std::time::Instant::now());
+            log::debug!("apf-watchdog: DHCP request from {client_mac}");
+        }
+        Ok(())
+    }
+
+    /// A DHCPACK is the only automatic source allowed to expand APF's ICMP pass-list.
+    /// The BPF program already verified server→client ports, BOOTREPLY and option 53=ACK;
+    /// this final gate limits it to auto mode, unicast IPv4 and the bounded 8-address ABI.
+    async fn on_dhcp_ack(&mut self, lease_ip: Ipv4Addr, client_mac: Mac) -> Result<()> {
+        if !self.initialized || !crate::types::is_learnable_unicast(&IpAddr::V4(lease_ip)) {
+            return Ok(());
+        }
+        let Some(wd) = &mut self.apf else {
+            return Ok(());
+        };
+        if !matches!(wd.mode, ApfWatchdogMode::Dhcp) {
+            return Ok(());
+        }
+        let now = std::time::Instant::now();
+        wd.dhcp_pending
+            .retain(|_, seen| now.duration_since(*seen) <= DHCP_ACK_WINDOW);
+        let Some(seen) = wd.dhcp_pending.remove(&client_mac) else {
+            log::debug!("apf-watchdog: ignoring DHCPACK {lease_ip} for {client_mac}: no recent guest DHCP request");
+            return Ok(());
+        };
+        if now.duration_since(seen) > DHCP_ACK_WINDOW {
+            return Ok(());
+        }
+        let fresh = !wd.dhcp_leases.contains_key(&client_mac);
+        if fresh && wd.dhcp_leases.len() == crate::cli::APF_WATCHDOG_MAX_GUESTS {
+            anyhow::bail!(
+                "apf-watchdog: DHCPACK {lease_ip} for {client_mac} exceeds the {}-lease limit",
+                crate::cli::APF_WATCHDOG_MAX_GUESTS
+            );
+        }
+        let changed = wd.dhcp_leases.insert(client_mac, lease_ip) != Some(lease_ip);
+        // DHCPACK carries the server-authoritative address and the client's chaddr. Learn
+        // immediately so the just-ACKed guest is demuxable before its first GARP/data frame.
+        self.do_learn(IpAddr::V4(lease_ip), client_mac).await?;
+        if changed {
+            log::info!("apf-watchdog: DHCPACK learned {lease_ip} -> {client_mac}; repatching APF");
+            self.apf_repatch("DHCPACK lease update").await;
+        }
         Ok(())
     }
 

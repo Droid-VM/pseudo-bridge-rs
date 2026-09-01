@@ -71,6 +71,17 @@ pub enum CopyEvent {
         requester_ip: std::net::Ipv4Addr,
         requester_mac: Mac,
     },
+    /// A DHCPACK observed on up0 ingress. The BPF prefilter recognizes BOOTREPLY
+    /// 67→68 with option 53=ACK; Core validates its DHCP payload before learning the
+    /// offered IPv4/MAC binding for automatic APF watchdog mode.
+    DhcpAck {
+        lease_ip: std::net::Ipv4Addr,
+        client_mac: Mac,
+    },
+    /// A DHCP client request observed on the guest-facing OUT path. Automatic mode only
+    /// accepts a following ACK for this client MAC while this short-lived transaction is
+    /// pending, so a DHCP broadcast for an unrelated WLAN peer cannot expand APF access.
+    DhcpRequest { client_mac: Mac },
     /// nft NFLOG: raw L3 payload + L2 metadata; parsed in the core. `reinject`
     /// (ND drop path) means the core must fix_csum + AF_PACKET send to up0.
     Nflog {

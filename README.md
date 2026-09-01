@@ -86,7 +86,8 @@ re-initializes when it comes back.
 | `--offload-workaround` | off | install learned guest addrs on up0 (`v4,v6,v6ll` subset) so an aggressive firmware filter (Android **APF**) answers ARP/NS for them; fwd-only |
 | `--offload-workaround-magic` | 4243672773 | `IFA_RT_PRIORITY` tag marking those proxy addresses as ours |
 | `--arp-keepalive` | 0 (off) | seconds; push-refresh upstream v4 neighbour caches (see below). Recommended on Android Wi-Fi: 10 |
-| `--apf-watchdog-guest <IPv4>` | off (repeatable; max 8) | **ebpf only**: explicit guest IPv4s whose inbound ICMP echo request gets re-patched to PASS after NetworkStack overwrites Qualcomm APF. IPv6, duplicates, a ninth address, and `-e nft` are rejected. |
+| `--apf-watchdog` | off | **ebpf only** automatic mode: observe DHCPACK leases for guest clients and maintain the APF IPv4 ICMP PASS list (max 8); mutually exclusive with the fixed-list flag below |
+| `--apf-watchdog-guest <IPv4>` | off (repeatable; max 8) | **ebpf only** fixed allow-list mode: named guest IPv4s whose inbound ICMP echo request gets re-patched to PASS after NetworkStack overwrites Qualcomm APF. IPv6, duplicates, a ninth address, and `-e nft` are rejected. |
 | `--apf-watchdog-debounce-ms` | 200 | coalesce one NetworkStack APF update's several vendor calls before one read/patch/write/readback transaction |
 | `--vmroute-table` / `--vmroute-rule` | 200 / 11000 | table + `iif lo` rule priority for host→VM `/32`·`/128` routes (fwd); `-1` disables |
 | `--loglevel` | info | env_logger filter (`RUST_LOG` overrides) |
@@ -133,10 +134,31 @@ pbridge -i wlan0 -e ebpf -m fwd-with-offload \
   --apf-watchdog-guest 192.168.1.205
 ```
 
-This is an explicit opt-in, fixed list of **at most eight IPv4 addresses**. It deliberately
-does not follow the dynamic learn/aging table: allowing ICMP to a guest expands the input
-surface, so the operator must name each address. `-e nft`, IPv6, duplicate values, and a
-ninth address fail at startup; there is no polling fallback.
+This is an explicit opt-in. There are two mutually-exclusive ways to choose the maximum eight
+IPv4 pass rules:
+
+```sh
+# Automatic DHCP mode: use leases from observed, validated DHCPACKs.
+pbridge -i wlan0 -e ebpf -m fwd-with-offload --apf-watchdog
+
+# Fixed mode: a static operator allow-list.
+pbridge -i wlan0 -e ebpf -m fwd-with-offload \
+  --apf-watchdog-guest 192.168.1.204 \
+  --apf-watchdog-guest 192.168.1.205
+```
+
+Automatic mode waits for a server-to-client DHCPACK (BOOTREPLY, UDP 67→68, DHCP message type
+ACK) and uses its `yiaddr` plus the DHCP client hardware address to establish the real guest
+binding before adding that address to the APF PASS list. A later ACK for the same client MAC
+replaces its prior lease and atomically replaces pbridge's own byte-identical APF insertion;
+no manual IP update is needed after a DHCP lease change. It fails closed at eight concurrent
+client leases and never scans a subnet or promotes arbitrary learned traffic into APF access.
+Before the first ACK, automatic mode leaves APF stock rather than installing an empty patch.
+
+Fixed mode retains active cold-start ARP discovery for each named address. Automatic DHCP mode
+intentionally does not probe guessed IPs: until a DHCPACK supplies a lease, there is no trusted
+target to ask. Both modes reject `-e nft`, IPv6, duplicate fixed values, a ninth address, and
+combining `--apf-watchdog` with `--apf-watchdog-guest`.
 
 With one or more addresses configured, the eBPF backend attaches a kprobe to Qualcomm's one
 APF vendor-command entry point, `wlan_hdd_cfg80211_apf_offload`. It records all calls except

@@ -495,6 +495,17 @@ fn parse_ring_event(d: &[u8]) -> Option<KernelEvent> {
         }));
     }
     let mac = Mac::from_slice(&d[0..6])?;
+    if d[6] == 3 && d[7] == 4 {
+        return Some(KernelEvent::Copy(CopyEvent::DhcpAck {
+            lease_ip: Ipv4Addr::new(d[8], d[9], d[10], d[11]),
+            client_mac: mac,
+        }));
+    }
+    if d[6] == 4 && d[7] == 4 {
+        return Some(KernelEvent::Copy(CopyEvent::DhcpRequest {
+            client_mac: mac,
+        }));
+    }
     let ev = parse_copy_event(d, mac)?;
     Some(KernelEvent::Copy(ev))
 }
@@ -584,6 +595,39 @@ mod parse_test {
         match super::parse_ring_event(&d) {
             Some(super::KernelEvent::Apf(ev)) => assert_eq!(ev.tgid, 4242),
             _ => panic!("expected an ApfExternalWrite"),
+        }
+    }
+
+    #[test]
+    fn dhcp_ack_ring_event() {
+        let mut d = [0u8; 24];
+        d[0..6].copy_from_slice(&[2, 0xaa, 0xbb, 0xcc, 0xdd, 4]);
+        d[6] = 3;
+        d[7] = 4;
+        d[8..12].copy_from_slice(&[192, 168, 1, 204]);
+        match super::parse_ring_event(&d) {
+            Some(super::KernelEvent::Copy(CopyEvent::DhcpAck {
+                lease_ip,
+                client_mac,
+            })) => {
+                assert_eq!(lease_ip, Ipv4Addr::new(192, 168, 1, 204));
+                assert_eq!(client_mac, Mac([2, 0xaa, 0xbb, 0xcc, 0xdd, 4]));
+            }
+            _ => panic!("expected a DhcpAck"),
+        }
+    }
+
+    #[test]
+    fn dhcp_request_ring_event() {
+        let mut d = [0u8; 24];
+        d[0..6].copy_from_slice(&[2, 0xaa, 0xbb, 0xcc, 0xdd, 4]);
+        d[6] = 4;
+        d[7] = 4;
+        match super::parse_ring_event(&d) {
+            Some(super::KernelEvent::Copy(CopyEvent::DhcpRequest { client_mac })) => {
+                assert_eq!(client_mac, Mac([2, 0xaa, 0xbb, 0xcc, 0xdd, 4]));
+            }
+            _ => panic!("expected a DhcpRequest"),
         }
     }
 

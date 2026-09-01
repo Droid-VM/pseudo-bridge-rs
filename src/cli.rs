@@ -227,6 +227,13 @@ pub struct Cli {
     #[arg(long = "vmroute-rule", default_value = "11000")]
     pub vmroute_rule: RouteTarget,
 
+    /// APF watchdog (Android/Qualcomm, `-e ebpf` only): automatically maintain the
+    /// firmware ICMP-echo PASS list from DHCPACK leases observed for guests behind
+    /// pbridge. Mutually exclusive with `--apf-watchdog-guest`, which is the fixed,
+    /// operator-supplied allow-list mode.
+    #[arg(long = "apf-watchdog", conflicts_with = "apf_watchdog_guest")]
+    pub apf_watchdog: bool,
+
     /// APF watchdog (Android/Qualcomm, `-e ebpf` only; repeatable, max 8 IPv4): keep an
     /// "ICMP echo request to this guest → PASS" rule alive in the Wi-Fi firmware's APF
     /// program. The Xiaomi vendor APF drops ALL inbound IPv4 ICMP echo requests
@@ -249,22 +256,33 @@ pub struct Cli {
     pub apf_watchdog_debounce_ms: u64,
 }
 
-/// Max `--apf-watchdog-guest` addresses. Each costs 9 program bytes (a `jeq r0,<ip>,PASS`)
+/// Max APF watchdog guest addresses. Each costs 9 program bytes (a `jeq r0,<ip>,PASS`)
 /// plus 2 for the shared `ldw r0,[30]`; the patcher also refuses to exceed the debugbuf.
 pub const APF_WATCHDOG_MAX_GUESTS: usize = 8;
 
-/// Validate the parsed CLI beyond what clap can express per-arg. Returns the deduplicated,
-/// sorted APF watchdog guest list (empty = feature off).
-pub fn validate_apf_watchdog(cli: &Cli) -> Result<Vec<Ipv4Addr>, String> {
-    if cli.apf_watchdog_guest.is_empty() {
-        return Ok(Vec::new());
+/// APF watchdog guest source. `Dhcp` only trusts DHCPACKs observed on the guest-facing
+/// segment; `Fixed` is the explicit operator allow-list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApfWatchdogMode {
+    Off,
+    Dhcp,
+    Fixed(Vec<Ipv4Addr>),
+}
+
+/// Validate the parsed CLI beyond what clap can express per-arg.
+pub fn validate_apf_watchdog(cli: &Cli) -> Result<ApfWatchdogMode, String> {
+    if !cli.apf_watchdog && cli.apf_watchdog_guest.is_empty() {
+        return Ok(ApfWatchdogMode::Off);
     }
     if cli.engine != Engine::Ebpf {
         return Err(
-            "--apf-watchdog-guest needs -e ebpf: overwrite detection is a BPF kprobe on the \
-             driver's APF vendor command, and there is no polling fallback"
+            "--apf-watchdog/--apf-watchdog-guest needs -e ebpf: overwrite detection is a BPF \
+             kprobe on the driver's APF vendor command, and there is no polling fallback"
                 .into(),
         );
+    }
+    if cli.apf_watchdog {
+        return Ok(ApfWatchdogMode::Dhcp);
     }
     let mut seen = std::collections::BTreeSet::new();
     for ip in &cli.apf_watchdog_guest {
@@ -280,7 +298,7 @@ pub fn validate_apf_watchdog(cli: &Cli) -> Result<Vec<Ipv4Addr>, String> {
     }
     // Sorted: the patcher emits one jeq per address in this order, so the generated
     // program (and therefore the readback compare) is independent of CLI argument order.
-    Ok(seen.into_iter().collect())
+    Ok(ApfWatchdogMode::Fixed(seen.into_iter().collect()))
 }
 
 /// Parse a u32 magic value as decimal or 0x-prefixed hex.
@@ -344,6 +362,7 @@ mod tests {
             arp_keepalive: 0,
             vmroute_table: RouteTarget(Some(200)),
             vmroute_rule: RouteTarget(Some(11000)),
+            apf_watchdog: false,
             apf_watchdog_guest: vec![],
             apf_watchdog_debounce_ms: 200,
         };
@@ -369,7 +388,7 @@ mod tests {
     fn apf_watchdog_off_by_default() {
         let cli = parse_args(&[]).unwrap();
         assert!(cli.apf_watchdog_guest.is_empty());
-        assert_eq!(validate_apf_watchdog(&cli), Ok(vec![]));
+        assert_eq!(validate_apf_watchdog(&cli), Ok(ApfWatchdogMode::Off));
     }
 
     #[test]
@@ -389,10 +408,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             validate_apf_watchdog(&cli),
-            Ok(vec![
+            Ok(ApfWatchdogMode::Fixed(vec![
                 Ipv4Addr::new(192, 168, 1, 7),
                 Ipv4Addr::new(192, 168, 1, 204)
-            ])
+            ]))
         );
 
         let dup = parse_args(&[
@@ -414,7 +433,13 @@ mod tests {
         }
         let refs: Vec<&str> = eight.iter().map(|s| s.as_str()).collect();
         let cli = parse_args(&refs).unwrap();
-        assert_eq!(validate_apf_watchdog(&cli).map(|v| v.len()), Ok(8));
+        assert_eq!(
+            validate_apf_watchdog(&cli).map(|v| match v {
+                ApfWatchdogMode::Fixed(v) => v.len(),
+                _ => 0,
+            }),
+            Ok(8)
+        );
 
         let mut nine = eight.clone();
         nine.push("--apf-watchdog-guest".into());
@@ -428,6 +453,13 @@ mod tests {
     }
 
     #[test]
+    fn apf_watchdog_auto_mode() {
+        let cli = parse_args(&["--apf-watchdog"]).unwrap();
+        assert_eq!(validate_apf_watchdog(&cli), Ok(ApfWatchdogMode::Dhcp));
+        assert!(parse_args(&["--apf-watchdog", "--apf-watchdog-guest", "192.168.1.204"]).is_err());
+    }
+
+    #[test]
     fn apf_watchdog_requires_ebpf() {
         let cli = Cli::try_parse_from([
             "pbridge",
@@ -437,8 +469,7 @@ mod tests {
             "nft",
             "-m",
             "fwd",
-            "--apf-watchdog-guest",
-            "192.168.1.204",
+            "--apf-watchdog",
         ])
         .unwrap();
         let err = validate_apf_watchdog(&cli).unwrap_err();

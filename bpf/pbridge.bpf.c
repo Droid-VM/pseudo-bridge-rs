@@ -86,6 +86,9 @@ struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
 #define O_UDP_SPORT 34
 #define O_UDP_DPORT 36
 #define O_UDP_CSUM 40
+#define O_BOOTP_OP 42
+#define O_BOOTP_YIADDR 58
+#define O_BOOTP_CHADDR 70
 #define O_BOOTP_FLAGS 52
 
 static __always_inline struct cfg *getcfg(void) {
@@ -123,6 +126,9 @@ static __always_inline int is_unspec16(const struct in6 *a) {
     for (int i = 0; i < 16; i++) if (a->a[i]) return 0;
     return 1;
 }
+
+static __always_inline void dhcp_request4(const __u8 *src);
+static __always_inline void dhcp_ack4(struct __sk_buff *skb);
 
 // Rewrite an ND LLA option to HOSTMAC and fix the ICMPv6 csum. opt_off = option
 // start (type,len,mac). Returns 1 if rewritten.
@@ -168,6 +174,7 @@ static __always_inline int out_common(struct __sk_buff *skb, int is_direct) {
             bpf_skb_load_bytes(skb, O_UDP_SPORT, &sp, 2);
             bpf_skb_load_bytes(skb, O_UDP_DPORT, &dp, 2);
             if (sp == hs(68) && dp == hs(67)) {
+                dhcp_request4(src);
                 __u8 bf[2] = {0x80, 0x00};
                 bpf_skb_store_bytes(skb, O_BOOTP_FLAGS, bf, 2, 0);
                 __u8 z[2] = {0, 0};
@@ -248,6 +255,45 @@ static __always_inline int out_common(struct __sk_buff *skb, int is_direct) {
 #undef TERM
 }
 
+static __always_inline int dhcp_is_ack(struct __sk_buff *skb) {
+    // DHCP magic cookie ends at offset 282. Avoid variable stack indexing (rejected by
+    // Android's verifier), but accept the two common layouts: message type first, or
+    // a 4-byte server-id option followed by message type.
+    __u8 opts[9] = {};
+    if (bpf_skb_load_bytes(skb, 282, opts, sizeof(opts)) < 0) return 0;
+    if (opts[0] == 53 && opts[1] == 1 && opts[2] == 5) return 1;
+    return opts[0] == 54 && opts[1] == 4 && opts[6] == 53
+        && opts[7] == 1 && opts[8] == 5;
+}
+
+static __always_inline void dhcp_request4(const __u8 *src) {
+    struct copy_evt ev = {};
+    // OUT already established UDP 68→67; do not reparse variable DHCP options here.
+    // The following ACK still carries the authoritative option-53=ACK + yiaddr.
+    for (int i = 0; i < 6; i++) ev.mac[i] = src[i];
+    ev.kind = 4; ev.fam = 4;
+    bpf_ringbuf_output(&events, &ev, sizeof(ev), 0);
+}
+
+static __always_inline void dhcp_ack4(struct __sk_buff *skb) {
+    // BOOTP starts at UDP payload offset 42. A DHCPACK is BOOTREPLY(op=2),
+    // server port 67 -> client port 68, and option 53 == 5. The device verifier
+    // requires the option to be at the first post-cookie slot; unknown layouts
+    // fail closed rather than expanding automatic APF access.
+    // chaddr is copied as the client identity; userspace bounds the automatic
+    // lease set and accepts it only in explicit `--apf-watchdog` DHCP mode.
+    __u8 op = 0;
+    __u32 yiaddr = 0;
+    struct copy_evt ev = {};
+    if (bpf_skb_load_bytes(skb, O_BOOTP_OP, &op, 1) < 0 || op != 2) return;
+    if (bpf_skb_load_bytes(skb, O_BOOTP_YIADDR, &yiaddr, 4) < 0 || !yiaddr) return;
+    if (!dhcp_is_ack(skb)) return;
+    if (bpf_skb_load_bytes(skb, O_BOOTP_CHADDR, ev.mac, 6) < 0) return;
+    ev.kind = 3; ev.fam = 4;
+    __builtin_memcpy(&ev.ip, &yiaddr, 4);
+    bpf_ringbuf_output(&events, &ev, sizeof(ev), 0);
+}
+
 static __always_inline int in_common(struct __sk_buff *skb, int is_direct) {
     struct cfg *c = getcfg();
     if (!c) return TC_ACT_OK;
@@ -266,6 +312,19 @@ static __always_inline int in_common(struct __sk_buff *skb, int is_direct) {
     __u32 fwd0 = c->fwd0_ifx;
     __u16 proto;
     if (bpf_skb_load_bytes(skb, O_ETHTYPE, &proto, 2) < 0) return TC_ACT_OK;
+    // DHCPACK is an inbound server->client packet. Surface it before host accept / multicast
+    // duplication so an unlearned DHCP guest gets a real binding as soon as it acquires its
+    // lease; normal bridge flooding still delivers the packet unchanged.
+    if (proto == hs(ETH_P_IP)) {
+        __u8 l4 = 0;
+        __u16 sp = 0, dp = 0;
+        bpf_skb_load_bytes(skb, O_V4_PROTO, &l4, 1);
+        if (l4 == 17) {
+            bpf_skb_load_bytes(skb, O_UDP_SPORT, &sp, 2);
+            bpf_skb_load_bytes(skb, O_UDP_DPORT, &dp, 2);
+            if (sp == hs(67) && dp == hs(68)) dhcp_ack4(skb);
+        }
+    }
 
     // host accept
     if (proto == hs(ETH_P_IP) && dst_is_host) {

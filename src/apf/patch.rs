@@ -48,11 +48,22 @@ pub fn plan(prog: &[u8], debugbuf_size: usize, guests: &[Ipv4Addr]) -> Result<Pl
         if found == guests {
             return Ok(Plan::AlreadyPatched);
         }
-        bail!(
-            "live APF program already carries a guest pass-list {found:?} that differs from the \
-             configured {guests:?}; refusing to edit an already-edited program (the next \
-             NetworkStack install restores a stock one to patch)"
-        );
+        // This is our byte-identical insertion, so it can be safely removed back to the
+        // stock layout before applying the new DHCP-derived set. Unlike an arbitrary
+        // patched program, we know its exact instruction bytes and can invert every jump
+        // and debugbuf adjustment. This lets a DHCP lease change replace the APF allow-list
+        // without waiting for NetworkStack to happen to reinstall stock first.
+        let stock = remove_our_rules(prog, &insns, &found)?;
+        let stock_insns = parse(&stock)?;
+        let stock_dbg = debugbuf_size_of(&stock, &stock_insns)?;
+        let site = find_icmp_drop_site(&stock, &stock_insns)?;
+        return Ok(Plan::Patch(apply(
+            &stock,
+            &stock_insns,
+            site,
+            stock_dbg,
+            guests,
+        )?));
     }
     let site = find_icmp_drop_site(prog, &insns)?;
     Ok(Plan::Patch(apply(
@@ -148,6 +159,96 @@ fn find_our_rules(prog: &[u8], insns: &[Insn]) -> Result<Option<Vec<Ipv4Addr>>> 
         }
     }
     Ok(None)
+}
+
+/// Remove a byte-identical pbridge insertion so a DHCP lease update can replace its guest
+/// set. This is deliberately narrower than a general "unpatch" facility: it only accepts
+/// the sequence `find_our_rules` recognized, and re-walks the recovered stock program.
+fn remove_our_rules(prog: &[u8], insns: &[Insn], guests: &[Ipv4Addr]) -> Result<Vec<u8>> {
+    let pass = prog.len();
+    let mut range = None;
+    for (k, drop) in insns.iter().enumerate() {
+        if drop.opcode != PASSDROP || drop.reg != 1 || drop.imm != ICMP_DROP_COUNTER {
+            continue;
+        }
+        let mut j = k;
+        let mut count = 0;
+        while j > 0 {
+            let cand = &insns[j - 1];
+            if cand.opcode == JEQ && cand.reg == 0 && cand.imm_len == 4 && cand.target == Some(pass)
+            {
+                count += 1;
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+        if count != guests.len() || j == 0 {
+            continue;
+        }
+        let ldw = &insns[j - 1];
+        if ldw.opcode == LDW && ldw.reg == 0 && ldw.imm == OFF_V4_DST {
+            let want = insertion_bytes(ldw.start, prog.len(), guests);
+            if prog.get(ldw.start..drop.start) == Some(&want[..]) {
+                range = Some((ldw.start, drop.start));
+                break;
+            }
+        }
+    }
+    let Some((start, end)) = range else {
+        bail!("cannot locate the byte-identical pbridge APF insertion to replace");
+    };
+    let delta = end - start;
+    let mut out = Vec::with_capacity(prog.len() - delta);
+    out.extend_from_slice(&prog[..start]);
+    out.extend_from_slice(&prog[end..]);
+
+    // Invert insertion's crossing-jump adjustment. These jump fields are before `start`,
+    // so their byte offsets do not move when the insertion disappears.
+    for i in insns {
+        let Some(target) = i.target else { continue };
+        if i.end <= start && target >= end {
+            if i.imm < delta as u32 {
+                bail!(
+                    "pbridge jump at byte {} underflows while removing prior insertion",
+                    i.start
+                );
+            }
+            let new = i.imm - delta as u32;
+            let at = i.jump_imm_at.expect("jump target has immediate");
+            out[at..at + i.jump_imm_len].copy_from_slice(&new.to_be_bytes()[4 - i.jump_imm_len..]);
+        }
+    }
+    let dbg = debugbuf_size_of(prog, insns)?;
+    let dbg_insn = insns
+        .iter()
+        .find(|i| i.opcode == EXT && i.imm == EXCEPTIONBUFFER_EXT)
+        .ok_or_else(|| anyhow::anyhow!("missing debugbuf"))?;
+    if dbg_insn.end > start || dbg + delta > u16::MAX as usize {
+        bail!("invalid debugbuf while removing prior pbridge insertion");
+    }
+    let at = dbg_insn.end - 2;
+    out[at..at + 2].copy_from_slice(&((dbg + delta) as u16).to_be_bytes());
+    let parsed = parse(&out)?;
+    if parsed.last().is_none_or(|i| i.end != out.len()) {
+        bail!("recovered APF stock program does not walk to its own end");
+    }
+    Ok(out)
+}
+
+fn debugbuf_size_of(prog: &[u8], insns: &[Insn]) -> Result<usize> {
+    let dbg: Vec<&Insn> = insns
+        .iter()
+        .filter(|i| i.opcode == EXT && i.imm == EXCEPTIONBUFFER_EXT)
+        .collect();
+    if dbg.len() != 1 {
+        bail!(
+            "expected exactly one APF debugbuf instruction, found {}",
+            dbg.len()
+        );
+    }
+    let at = dbg[0].end - 2;
+    Ok(u16::from_be_bytes(prog[at..at + 2].try_into().unwrap()) as usize)
 }
 
 /// The bytes we insert at `insert_at` for a program whose final length is `final_len`.
@@ -447,13 +548,41 @@ mod tests {
     }
 
     #[test]
-    fn patched_with_a_different_guest_set_is_refused() {
+    fn patched_with_a_different_guest_set_is_replaced() {
         let once = patched(LIVE, &[ip("192.168.1.204")]);
         let dbg = debugbuf_of(&once).unwrap();
-        let err = plan(&once, dbg, &[ip("192.168.1.7")])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("differs from the configured"), "{err}");
+        let updated = match plan(&once, dbg, &[ip("192.168.1.7")]).unwrap() {
+            Plan::Patch(p) => p,
+            Plan::AlreadyPatched => panic!("a different guest set must be replaced"),
+        };
+        let insns = parse(&updated).unwrap();
+        assert_eq!(
+            find_our_rules(&updated, &insns).unwrap(),
+            Some(vec![ip("192.168.1.7")])
+        );
+        assert_eq!(
+            updated.len(),
+            once.len(),
+            "one guest replaces one guest without growth"
+        );
+    }
+
+    #[test]
+    fn patched_guest_set_can_grow_and_shrink() {
+        let once = patched(LIVE, &[ip("192.168.1.204")]);
+        let dbg = debugbuf_of(&once).unwrap();
+        let two = match plan(&once, dbg, &[ip("192.168.1.204"), ip("192.168.1.205")]).unwrap() {
+            Plan::Patch(p) => p,
+            _ => panic!("must replace one guest with two"),
+        };
+        assert_eq!(two.len(), once.len() + 9);
+        let two_insns = parse(&two).unwrap();
+        assert_eq!(find_our_rules(&two, &two_insns).unwrap().unwrap().len(), 2);
+        let shrunk = match plan(&two, debugbuf_of(&two).unwrap(), &[ip("192.168.1.205")]).unwrap() {
+            Plan::Patch(p) => p,
+            _ => panic!("must replace two guests with one"),
+        };
+        assert_eq!(shrunk.len(), once.len());
     }
 
     #[test]
