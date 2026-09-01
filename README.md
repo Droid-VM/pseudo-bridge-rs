@@ -80,7 +80,7 @@ re-initializes when it comes back.
 | `-m, --mode` | — | `direct` \| `fwd` \| `fwd-with-offload` |
 | `-b, --bridge` | — | enslave the guest-facing port (direct: up0, fwd: fwd1) into this existing bridge at session init — its only job; discovery stays dynamic |
 | `--fwd-device-if/-br` | `{if}-if` / `{if}-br` | veth names in fwd mode |
-| `--timeout` | 30 | entry idle aging (seconds) |
+| `--timeout` | 30 | entry aging base interval (seconds); probe at timeout/2, flush on the next tick |
 | `--max-cap` | `16,64,256,1024` | caps: v4/mac, v6/mac, v4 global, v6 global (FIFO evict) |
 | `--nflog-group` | 32123 | NFLOG group (nft engine) |
 | `--offload-workaround` | off | install learned guest addrs on up0 (`v4,v6,v6ll` subset) so an aggressive firmware filter (Android **APF**) answers ARP/NS for them; fwd-only |
@@ -108,9 +108,21 @@ re-initializes when it comes back.
 
 When an ARP request for an already learned guest reaches `up0`, pbridge also emits an
 immediate unicast proxy reply (`guest-IP is-at HOSTMAC`). The original request remains
-on the existing path toward the guest, so a guest reply is harmlessly additive.
+on the existing path toward the guest, so a guest reply is harmlessly additive. In `fwd`
+mode, every learned guest also gets a host-side neighbour entry on `up0` (`guest-IP ->
+HOSTMAC`) and, when attached, on the VM bridge (`guest-IP -> guest-MAC`). The up0 egress
+hook demuxes host-originated IPv4/IPv6 packets for known guests to `fwd0`; this makes a
+first host packet succeed even when its route/ARP lookup started before learning completed.
+Entries are removed only while the recorded MAC still matches, so pbridge does not delete
+a user replacement.
 Requests with `spa=0.0.0.0` (ACD probes) are ignored. If APF/firmware drops the request
 before `up0`, software cannot observe it; keep `--arp-keepalive 10` for that case.
+
+Before aging, pbridge actively probes every installed guest: an anonymous ARP probe for
+IPv4 and a DAD-style Neighbor Solicitation for IPv6. In `fwd` mode the probe enters the
+guest bridge through `fwd0`; in `direct` mode it is injected through the bridge master.
+The guest's ARP reply or Neighbor Advertisement follows the normal OUT path and refreshes
+the kernel `seen` mark. Only an unanswered probe is removed by the following aging flush.
 
 ## Tests
 

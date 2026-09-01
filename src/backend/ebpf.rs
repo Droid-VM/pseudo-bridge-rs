@@ -281,6 +281,28 @@ impl Backend for EbpfBackend {
         Ok(())
     }
 
+    fn arm_probe(&mut self) -> Result<()> {
+        // Clear the current round without removing keys: probe replies set the bit again,
+        // and flush() can then distinguish a response from an idle entry.
+        {
+            let map = self.ebpf()?.map_mut("seen4").ok_or_else(|| anyhow!("no seen4"))?;
+            let mut s: AyaHashMap<&mut MapData, u32, u8> = AyaHashMap::try_from(map)?;
+            let keys: Vec<u32> = s.keys().filter_map(|k| k.ok()).collect();
+            for k in keys {
+                let _ = s.insert(k, 0u8, 0);
+            }
+        }
+        {
+            let map = self.ebpf()?.map_mut("seen6").ok_or_else(|| anyhow!("no seen6"))?;
+            let mut s: AyaHashMap<&mut MapData, In6, u8> = AyaHashMap::try_from(map)?;
+            let keys: Vec<In6> = s.keys().filter_map(|k| k.ok()).collect();
+            for k in keys {
+                let _ = s.insert(k, 0u8, 0);
+            }
+        }
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<Vec<IpAddr>> {
         let mut alive = Vec::new();
         // seen4 second-chance

@@ -137,7 +137,10 @@ static __always_inline int out_common(struct __sk_buff *skb, int is_direct) {
 #define TERM (is_direct ? TC_ACT_OK : bpf_redirect(to, 0))
 
     if (mac_eq(src, c->hostmac)) {
-        if (is_direct) return (skb->ingress_ifindex == 0) ? TC_ACT_OK : TC_ACT_SHOT;
+        // In fwd mode this is the host-originated packet that egress_guard already
+        // demuxed to a learned guest. Locally-generated skbs retain ingress_ifindex=0;
+        // bridge flood copies and guest-originated redirects do not.
+        if (skb->ingress_ifindex == 0) return TC_ACT_OK;
         return TC_ACT_SHOT;
     }
     if (!is_direct && c->has_brmac && mac_eq(src, c->brmac)) return TC_ACT_SHOT;
@@ -310,6 +313,34 @@ static __always_inline int in_common(struct __sk_buff *skb, int is_direct) {
     return TC_ACT_OK;
 }
 
+// A host-originated packet can briefly keep the connected up0 route that was selected
+// before the guest learned. Its up0 neighbour is filled with HOSTMAC by the control plane;
+// demux the packet here so that queued traffic still reaches the guest instead of leaving
+// wlan0 with a destination of HOSTMAC. Packets redirected from fwd0 have a non-zero
+// ingress_ifindex and are deliberately left on the normal upstream path (guest-to-guest
+// traffic must not loop back into fwd0).
+static __always_inline int host_egress_demux(struct __sk_buff *skb, struct cfg *c, __u16 proto) {
+    if (skb->ingress_ifindex != 0 || c->fwd0_ifx == 0) return 0;
+    if (proto == hs(ETH_P_IP)) {
+        __u32 dst;
+        if (bpf_skb_load_bytes(skb, O_V4_DST, &dst, 4) < 0) return 0;
+        struct mac *m = bpf_map_lookup_elem(&ip2mac4, &dst);
+        if (m) {
+            bpf_skb_store_bytes(skb, O_ETH_DST, m->a, 6, 0);
+            return bpf_redirect(c->fwd0_ifx, 0);
+        }
+    } else if (proto == hs(ETH_P_IPV6)) {
+        struct in6 dst;
+        if (bpf_skb_load_bytes(skb, O_V6_DST, &dst, 16) < 0) return 0;
+        struct mac *m = bpf_map_lookup_elem(&ip2mac6, &dst);
+        if (m) {
+            bpf_skb_store_bytes(skb, O_ETH_DST, m->a, 6, 0);
+            return bpf_redirect(c->fwd0_ifx, 0);
+        }
+    }
+    return 0;
+}
+
 __attribute__((section("classifier/fwd_out"), used))
 int fwd_out(struct __sk_buff *skb) { return out_common(skb, 0); }
 __attribute__((section("classifier/fwd_in"), used))
@@ -328,8 +359,9 @@ int egress_guard(struct __sk_buff *skb) {
     if (!mac_eq(src, c->hostmac)) bpf_skb_store_bytes(skb, O_ETH_SRC, c->hostmac, 6, 0);
 
     // Discovery dup: a host-originated ARP-request / NS for an unknown target is cloned to
-    // fwd0 so a *silent* guest (static IP, no traffic yet) replies and gets learned — then
-    // host->guest works on retry via the /32-/128 vmroute. Clone (not redirect): the original
+    // fwd0 so a *silent* guest (static IP, no traffic yet) replies and gets learned. The host
+    // egress demux handles a packet that was queued on up0 while learning completed. Clone
+    // (not redirect): the original
     // still goes upstream so the gateway is still resolved. Only host-originated: if the
     // source IP is already a learned guest (in ip2mac), it's guest ARP/NS that was redirected
     // here, so we don't echo it back.
@@ -346,6 +378,8 @@ int egress_guard(struct __sk_buff *skb) {
     // discover a silent guest, and the kernel falls back to multicast resolution anyway.
     __u16 proto;
     if (bpf_skb_load_bytes(skb, O_ETHTYPE, &proto, 2) < 0) return TC_ACT_OK;
+    int host_demux = host_egress_demux(skb, c, proto);
+    if (host_demux) return host_demux;
     __u8 dst[6];
     if (bpf_skb_load_bytes(skb, O_ETH_DST, dst, 6) < 0) return TC_ACT_OK;
     if (proto == hs(ETH_P_ARP)) {

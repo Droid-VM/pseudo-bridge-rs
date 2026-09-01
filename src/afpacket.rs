@@ -100,7 +100,8 @@ pub fn build_arp_request(target: Ipv4Addr, sender: Ipv4Addr, hostmac: Mac) -> Ve
 }
 
 /// RFC 5227 ACD-style ARP probe for `target`: broadcast request, spa=0.0.0.0,
-/// sha=hostmac. The offload keepalive probe (injected on fwd0 → vmbr). spa=0 is the
+/// sha=hostmac. The aging probe is injected on the guest-facing bridge (fwd0 in fwd
+/// mode, the bridge master in direct mode). spa=0 is the
 /// point: an ARP request's spa/sha pair updates the receiver's cache (RFC 826), and
 /// this frame is delivered INSIDE the guest bridge where the host's L2 identity is the
 /// bridge mac, not HOSTMAC — a probe carrying "host-ip @ HOSTMAC" repoints the guest's
@@ -126,7 +127,7 @@ pub fn build_arp_probe(target: Ipv4Addr, hostmac: Mac) -> Vec<u8> {
 }
 
 /// DAD-style Neighbor Solicitation for `target`: src=::, NO SLLAO, to the target's
-/// solicited-node multicast. Offload keepalive probe, v6 counterpart of
+/// solicited-node multicast. Aging probe, v6 counterpart of
 /// `build_arp_probe` and non-poisonous for the same reason: RFC 4861 forbids cache
 /// updates from an NS with an unspecified source (and a DAD NS carries no SLLAO), so
 /// the guest learns nothing — but as the address owner it MUST defend with an NA to

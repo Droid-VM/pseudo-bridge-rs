@@ -1,8 +1,8 @@
 # pbridge Android 实机测试记录
 
-本文记录方案 2（删除 guest `/32` 的 local route，由 pbridge 代理 ARP）的 Android
-实机验证。测试使用临时 Linux network namespace 模拟一个 guest，不会修改 guest
-系统或 Wi-Fi 固件配置。
+本文记录方案 2（删除 guest `/32` 的 local route，由 pbridge 代理 ARP，并回填 host
+邻居）的 Android 实机验证。测试使用临时 Linux network namespace 模拟一个 guest，
+不会修改 guest 系统或 Wi-Fi 固件配置。
 
 ## 测试环境
 
@@ -214,7 +214,189 @@ ip link del vmbr 2>/dev/null || true'
 - `ip route show table 200` 为空，pbridge 的 rule 已撤销；
 - `wlan0` 仍为 `192.168.1.39/24`，原有 Wi-Fi 连接未改变。
 
+## aging probe 版本的直接 adb 验证
+
+在完成“老化前主动 ARP/NS probe，收到 guest 回复则保留、无回复才删除”后，使用同一台
+设备直接运行新构建产物（不运行测试套件），并临时创建一个 veth guest 接入 `vmbr`：
+
+```sh
+./build.sh arm64
+adb -s b784178b push dist/pbridge-android-arm64 /data/local/tmp/pbridge-new
+adb -s b784178b shell chmod 755 /data/local/tmp/pbridge-new
+adb -s b784178b shell 'RUST_LOG=debug nohup /data/local/tmp/pbridge-new \
+  -i wlan0 -e ebpf -m fwd --timeout 4 --arp-keepalive 0 \
+  >/data/local/tmp/pbridge-new.log 2>&1 </dev/null & p=$!; \
+  sleep 5; kill -INT "$p"; sleep 2; cat /data/local/tmp/pbridge-new.log'
+```
+
+结果：
+
+- `pbridge 0.1.0` 可执行，aarch64 静态 ELF 在设备上正常运行；
+- Android `6.6.118-android15-8` 内核完成 BTF/TC eBPF 装载，日志出现
+  `ebpf backend running`；
+- guest `192.168.1.200` 到真实网关 `192.168.1.1` ping 为 `1/1`，并成功学习为
+  `vmroute /32@table200`；
+- guest 侧抓包实际看到匿名 probe 和回复：
+
+  ```text
+  e2:ec:48:c1:e3:79 > ff:ff:ff:ff:ff:ff  ARP Request who-has 192.168.1.200 tell 0.0.0.0
+  be:a1:43:e4:04:d1 > e2:ec:48:c1:e3:79  ARP Reply 192.168.1.200 is-at be:a1:43:e4:04:d1
+  e2:ec:48:c1:e3:79 > 33:33:ff:e4:04:d1  :: > ff02::1:ffe4:4d1  Neighbor Solicitation
+  be:a1:43:e4:04:d1 > 33:33:00:00:00:01  Neighbor Advertisement
+  ```
+
+  IPv4 的 `tell 0.0.0.0` 和 IPv6 的 `src=::` 说明 probe 没有把 host 地址写入 guest
+  的邻居缓存；对应 ARP/NA 回复已从 guest 返回到 pbridge OUT 路径。
+- `SIGINT` 后正常执行 `teardown`，没有残留 `pbridge-new` 进程或 `wlan0-if`；
+- 测试结束已删除临时 `pbguest`、veth 和 `vmbr`，设备 Wi-Fi 接口恢复原状。
+
+## adb 临时 VM 端到端验证
+
+本次没有运行测试套件，直接在 `b784178b` 上创建临时 `pbguest2` network namespace、
+`pbv2-host/pbv2-guest` veth 和 `pbvmbr2` bridge，启动：
+
+```sh
+/data/local/tmp/pbridge-new -i wlan0 -e ebpf -m fwd -b pbvmbr2 \
+  --timeout 6 --arp-keepalive 0
+```
+
+guest 使用 `192.168.1.201/24`，MAC 为 `da:bd:4a:ea:74:21`。实测结果：
+
+1. guest -> 真实网关 `192.168.1.1`：`2/2` 成功，pbridge 日志出现
+   `vmroute add 192.168.1.201`。
+2. guest 侧抓包看到老化探测及回复：
+
+   ```text
+   e2:ec:48:c1:e3:79 > ff:ff:ff:ff:ff:ff  ARP Request who-has 192.168.1.201 tell 0.0.0.0
+   da:bd:4a:ea:74:21 > e2:ec:48:c1:e3:79  ARP Reply 192.168.1.201 is-at da:bd:4a:ea:74:21
+   e2:ec:48:c1:e3:79 > 33:33:ff:e4:04:d1  :: > ff02::1:ffe4:4d1  Neighbor Solicitation
+   da:bd:4a:ea:74:21 > 33:33:00:00:00:01  Neighbor Advertisement
+   ```
+
+   说明 guest 收到了 IPv4 ACD probe、IPv6 DAD-style NS，并通过 ARP/NA 回复刷新存活
+   状态。
+3. 删除 guest 的 `192.168.1.201` 地址并保持静默约 8 秒后，日志出现
+   `vmroute del 192.168.1.201 (expired/evicted)`，`table 200` 中不再有该路由。
+4. 重新加回地址后，guest 再 ping 网关 `2/2` 成功，日志再次出现 `vmroute add`；随后
+   Android host 执行 `ip route get 192.168.1.201` 显示走 `pbvmbr2 table 200`，
+   host -> guest ping `3/3` 成功。
+
+验证结束已停止 pbridge，并删除 `pbguest2`、veth、`pbvmbr2`；无残留 pbridge 进程、
+临时接口或 guest 路由。
+
+## 验证 ARP 代答是否依赖 host -> guest 首包
+
+为排除真实网关邻居缓存影响，另外在同一设备上创建了隔离的模拟上游 `pbgw`（
+`10.77.0.1`）和模拟 VM `pbguest3`（`10.77.0.201`），pbridge 的 `up0` 使用临时
+`pbup0` veth。流程中没有执行 host -> guest ping：
+
+1. 仅由 guest -> `10.77.0.1` ping `2/2`，学习 `10.77.0.201`，日志出现
+   `vmroute add 10.77.0.201`。
+2. 删除 guest 的 `10.77.0.201` 地址，使 guest 不可能自己回复 ARP；清空模拟上游的
+   邻居项。
+3. 直接由 `pbgw` ping `10.77.0.201`。ICMP 没有回复是预期的，因为 guest 地址已删除，
+   但 pbridge 日志出现：
+
+   ```text
+   arp-proxy: 10.77.0.201 is-at 1e:f6:27:c5:30:40 -> 10.77.0.1 (82:5f:6d:51:f5:03)
+   ```
+
+   同时 `pbgw` 邻居表为：
+
+   ```text
+   10.77.0.201 lladdr 1e:f6:27:c5:30:40 STALE
+   ```
+
+结论：pbridge 代答 ARP 只需要 guest IP 已经存在于 `installed/ip2mac` 学习表，并不
+需要先发 host -> guest 首包。guest 尚未被学习时，discovery probe 会先触发学习；
+加入 host 邻居回填后，host 首包也可在学习完成后直接送入 guest。
+
+## host 首包实测（先 host ping guest，已加入邻居回填）
+
+为验证 host 首包，创建新的临时 `pbguest-neigh/pbvmbr-neigh`，guest 只配置
+`192.168.1.203/24`，不先发送 IPv4 流量。清空 host 两侧邻居项后，pbridge 启动后
+直接在 Android host 执行：
+
+```sh
+ip neigh del 192.168.1.203 dev wlan0 2>/dev/null || true
+ip neigh del 192.168.1.203 dev pbvmbr-neigh 2>/dev/null || true
+ping -c 1 -W 3 192.168.1.203
+```
+
+结果为 `1 packets transmitted, 1 received, 0% packet loss`。guest 抓包同时显示
+pbridge 已克隆匿名 ARP probe，guest 也已经回复：
+
+```text
+e2:ec:48:c1:e3:79 > ff:ff:ff:ff:ff:ff  who-has 192.168.1.203 tell 0.0.0.0
+02:aa:bb:cc:dd:03 > e2:ec:48:c1:e3:79  192.168.1.203 is-at 02:aa:bb:cc:dd:03
+```
+
+此时 pbridge 日志出现 `vmroute add 192.168.1.203`，host 邻居项为：
+
+```text
+wlan0        192.168.1.203 lladdr e2:ec:48:c1:e3:79 REACHABLE
+pbvmbr-neigh 192.168.1.203 lladdr 02:aa:bb:cc:dd:03 REACHABLE
+```
+
+没有出现 `arp-proxy` 日志是正常的，因为该 ARP 是 host 出向请求，不是从 `wlan0`
+入向的 ARP。结论是：host 侧邻居回填配合 up0 egress demux 可以让 guest 尚未有
+IPv4 流量时的 host 首包直接成功；上游入向 ARP 代答仍用于外部 peer 解析已学习的
+guest，`--arp-keepalive 10` 仍用于规避 APF/firmware 前置丢包。验证结束后已清理
+临时 guest、veth、bridge、pbridge 进程和路由。
+
 ## 结论和限制
+
+## 开发机 Linux -> 安卓模拟 guest
+
+为验证真实外部 Linux 主机而不是 Android host 自身，使用开发机
+`192.168.1.114/24`，安卓 `wlan0=192.168.1.39/24`，并在安卓上创建临时
+`pbguest-linux` netns：
+
+```text
+guest IPv4 = 192.168.1.204/24
+guest MAC  = 02:aa:bb:cc:dd:04
+bridge     = pbvmbr-linux
+```
+
+pbridge 启动参数为 `-i wlan0 -e ebpf -m fwd -b pbvmbr-linux --timeout 30
+--arp-keepalive 0`。先不让 guest 发 IPv4 流量，清空开发机邻居项后直接执行：
+
+```sh
+ip neigh del 192.168.1.204 dev eth0 2>/dev/null || true
+ping -c 3 -W 3 192.168.1.204
+```
+
+结果为 `3/3` 超时并显示 `Destination Host Unreachable`。安卓 `wlan0` 抓包、
+`ip monitor neigh` 和 pbridge 日志均没有看到这次 ARP request，说明该 WLAN/APF
+在报文到达 `wlan0` ingress 之前就过滤了“尚未学习的 guest 地址”。因此软件 ARP
+代答没有机会执行；host 侧邻居回填也只能填充安卓内核的 `wlan0`/bridge 邻居，不能
+直接写入远端 Linux 的邻居缓存。
+
+随后让 guest 主动 ping 网关一次：
+
+```sh
+adb shell 'ip netns exec pbguest-linux ping -c 1 -W 3 192.168.1.1'
+```
+
+pbridge 学习并写入：
+
+```text
+vmroute add 192.168.1.204 -> 02:aa:bb:cc:dd:04 [route /32@table200]
+wlan0        192.168.1.204 -> e2:ec:48:c1:e3:79 REACHABLE
+pbvmbr-linux 192.168.1.204 -> 02:aa:bb:cc:dd:04 REACHABLE
+```
+
+此后开发机 Linux 直接执行 `ping -c 3 -W 2 192.168.1.204`，实测一次为
+`3/3` 成功，证明已学习后的 host 邻居回填、up0 egress demux、guest-facing
+转发和返回路径均可工作。再次删除开发机邻居并重复 ARP 时，因 WLAN 客户端隔离
+而可能重新得到 `FAILED`；这不是 pbridge 数据转发失败，而是外部 ARP 没有进入
+安卓软件路径。
+
+使用 `--arp-keepalive 10` 的对照运行中，日志每 10 秒出现 keepalive，每 30 秒
+出现一次 GARP；它能保持网关等已知邻居，但本次 WLAN 不会把 GARP/ARP 转发给开发机，
+所以不能绕过该客户端隔离。对于允许客户端间 ARP 的网络，入向 ARP request 到达
+`wlan0` 后，pbridge 的 `arp-proxy` 会以 HOSTMAC 代答；在本机实测的前置过滤场景
+下仍应保留 `--arp-keepalive 10`，以避免网关主动重新解析 guest。
 
 本次实机测试确认方案 2 在 Android 17（API 37）userspace、`android15-8` GKI 6.6
 arm64 内核上可工作：guest 出网、host -> guest、ARP 代理、guest MAC 隐藏和 10 秒

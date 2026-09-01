@@ -177,7 +177,8 @@ pub struct Cli {
     #[arg(long = "nflog-group", default_value_t = 32123)]
     pub nflog_group: u16,
 
-    /// entry idle aging seconds.
+    /// entry aging base interval in seconds; pbridge probes guests at timeout/2 and flushes
+    /// liveness on the next tick, removing only entries that did not answer.
     #[arg(long = "timeout", default_value_t = 30)]
     pub timeout: u64,
 

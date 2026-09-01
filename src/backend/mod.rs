@@ -104,12 +104,16 @@ pub trait Backend: Send {
     fn withdraw_entry(&mut self, ip: IpAddr) -> Result<()>;
 
     /// Re-assert liveness for ip from the control plane (same effect as a datapath
-    /// seen mark). Called when a keepalive probe is grace-skipped: the skip's safety
+    /// seen mark). Called when an aging probe is grace-skipped: the skip's safety
     /// must not hang on the remaining lifetime of a mark that may be almost a full
     /// period old — nft's seen is a kernel-clock timeout, so a control frame landing
     /// just after a flush leaves an arbitrarily thin margin, and any lateness of the
     /// aging timer then evicts a live guest (ebpf's mark-bit has no such race).
     fn refresh_seen(&mut self, ip: IpAddr) -> Result<()>;
+
+    /// Start an aging probe round by clearing the current liveness marks. Replies to the
+    /// probes recreate/raise the marks through the normal datapath before `flush()` runs.
+    fn arm_probe(&mut self) -> Result<()>;
 
     /// Aging: advance liveness and return the set of IPs still alive.
     fn flush(&mut self) -> Result<Vec<IpAddr>>;

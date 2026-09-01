@@ -479,6 +479,85 @@ impl Net {
         out
     }
 
+    /// Install a host-side neighbour entry. The entry is deliberately REACHABLE rather
+    /// than a kernel-resolved INCOMPLETE entry: fwd-mode host traffic initially follows
+    /// up0 while the guest is being learned, and the egress demux then sends frames with
+    /// this HOSTMAC mapping into fwd0.
+    pub async fn neighbour_replace(&self, ifindex: u32, ip: IpAddr, mac: Mac) -> Result<()> {
+        use netlink_packet_route::neighbour::NeighbourState;
+        self.handle
+            .neighbours()
+            .add(ifindex, ip)
+            .link_layer_address(mac.bytes())
+            .state(NeighbourState::Reachable)
+            .replace()
+            .execute()
+            .await
+            .context("neighbour_replace")
+    }
+
+    /// Read the current link-layer address for one neighbour. Best-effort callers use this
+    /// before deleting an entry so a user-replaced neighbour is never removed by pbridge.
+    pub async fn neighbour_lladdr(&self, ifindex: u32, ip: IpAddr) -> Option<Mac> {
+        use netlink_packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
+        let family = match ip {
+            IpAddr::V4(_) => rtnetlink::IpVersion::V4,
+            IpAddr::V6(_) => rtnetlink::IpVersion::V6,
+        };
+        let mut s = self.handle.neighbours().get().set_family(family).execute();
+        while let Ok(Some(m)) = s.try_next().await {
+            if m.header.ifindex != ifindex {
+                continue;
+            }
+            let mut dst = None;
+            let mut mac = None;
+            for a in &m.attributes {
+                match a {
+                    NeighbourAttribute::Destination(NeighbourAddress::Inet(v)) => {
+                        dst = Some(IpAddr::V4(*v));
+                    }
+                    NeighbourAttribute::Destination(NeighbourAddress::Inet6(v)) => {
+                        dst = Some(IpAddr::V6(*v));
+                    }
+                    NeighbourAttribute::LinkLayerAddress(b) => mac = Mac::from_slice(b),
+                    _ => {}
+                }
+            }
+            if dst == Some(ip) {
+                return mac;
+            }
+        }
+        None
+    }
+
+    /// Delete a neighbour only when it still has the MAC pbridge installed. This protects
+    /// a user-created/replaced entry at the same IP from a later guest withdrawal.
+    pub async fn neighbour_del_if(&self, ifindex: u32, ip: IpAddr, expected: Mac) -> Result<bool> {
+        use netlink_packet_route::neighbour::{NeighbourAddress, NeighbourAttribute, NeighbourMessage};
+        if self.neighbour_lladdr(ifindex, ip).await != Some(expected) {
+            return Ok(false);
+        }
+        let mut msg = NeighbourMessage::default();
+        msg.header.ifindex = ifindex;
+        msg.header.family = match ip {
+            IpAddr::V4(_) => AddressFamily::Inet,
+            IpAddr::V6(_) => AddressFamily::Inet6,
+        };
+        msg.attributes.push(NeighbourAttribute::Destination(match ip {
+            IpAddr::V4(v) => NeighbourAddress::Inet(v),
+            IpAddr::V6(v) => NeighbourAddress::Inet6(v),
+        }));
+        match self.handle.neighbours().del(msg).execute().await {
+            Ok(()) => Ok(true),
+            Err(rtnetlink::Error::NetlinkError(e))
+                if e.raw_code() == -libc::ENOENT || e.raw_code() == -libc::ESRCH =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e).context("neighbour_del"),
+        }
+    }
+
     /// IPv6 default-route gateway addresses (next-hops of ::/0). Used by the
     /// ND-offload proxy guard to never claim the upstream router's own address.
     /// Best-effort: returns empty on any error.

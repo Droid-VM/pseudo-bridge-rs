@@ -11,7 +11,7 @@ use crate::netlink::{AddrInfo, Net};
 use crate::packet::{build_frame, classify_learn, fix_icmpv6_csum, ETHERTYPE_IPV6};
 use crate::state::Entries;
 use crate::types::{family, is_learnable_unicast, is_link_local, Family, Mac};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
@@ -61,8 +61,12 @@ pub struct Core {
     saved_br_cfg: Option<SavedBrCfg>, // fwd: bridge IPv6 knobs to restore on detach
     nd_proxied: HashSet<IpAddr>,  // offload-workaround: guest addrs we installed on up0
     installed: HashMap<IpAddr, Mac>, // vmroutes currently programmed (for transition logging)
-    fwd0_injector: Option<Injector>, // fwd: AF_PACKET on fwd0, for the offload keepalive probe
-    aging_tick: u64,                 // counts aging ticks (probe/flush alternation in offload)
+    /// Neighbours written by pbridge, keyed by (ifindex, guest IP) with the expected MAC.
+    /// The expected value lets withdrawal avoid deleting a user replacement.
+    host_neighs: HashMap<(u32, IpAddr), Mac>,
+    probe_injector: Option<Injector>, // guest-facing AF_PACKET device for aging probes
+    aging_tick: u64,                 // counts aging ticks (probe/flush alternation)
+    skip_flush_once: bool,            // probe send failure: preserve entries for one tick
     keepalive_tick: u64,             // counts --arp-keepalive ticks (GARP every Nth)
 }
 
@@ -98,8 +102,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         saved_br_cfg: None,
         nd_proxied: HashSet::new(),
         installed: HashMap::new(),
-        fwd0_injector: None,
+        host_neighs: HashMap::new(),
+        probe_injector: None,
         aging_tick: 0,
+        skip_flush_once: false,
         keepalive_tick: 0,
     };
     if core.cli.offload_workaround.is_some() && !core.is_fwd() {
@@ -111,9 +117,11 @@ pub async fn run(cli: Cli) -> Result<()> {
         log::warn!("initial sync error: {e:#}");
     }
 
-    // Offload mode runs the aging timer at timeout/2 and alternates probe/flush (a probe
-    // keeps silent-but-present proxied guests alive); otherwise it flushes once per timeout.
-    let aging_secs = if core.offload_active() { (timeout / 2).max(1) } else { timeout.max(1) };
+    // Every aging cycle first probes guests, then flushes liveness on the next tick. A
+    // reply marks the entry alive in the datapath; an unanswered probe is removed by the
+    // following flush. Half-period ticks put the probe immediately before the aging
+    // decision while allowing a silent-but-present guest to defend its address first.
+    let aging_secs = (timeout / 2).max(1);
     let mut aging = tokio::time::interval(Duration::from_secs(aging_secs));
     // If the loop stalls past a period (e.g. a slow nft rebuild), don't fire make-up
     // ticks back-to-back: bursty flushes would halve the effective idle timeout.
@@ -199,11 +207,6 @@ impl Core {
             }
             _ => None,
         })
-    }
-
-    /// Whether the offload workaround is active (drives the keepalive probe + faster aging).
-    fn offload_active(&self) -> bool {
-        self.offload_cfg().is_some()
     }
 
     async fn recompute(&self) -> Result<Snap> {
@@ -330,6 +333,14 @@ impl Core {
         let brmac_changed = old.brmac != new.brmac;
         let hostips_changed = old.host_ip_set() != new.host_ip_set();
         let br_changed = old.br_index != new.br_index || old.fwd0_index != new.fwd0_index;
+
+        if br_changed {
+            let probe_ifindex = if self.is_fwd() { new.fwd0_index } else { new.br_index };
+            self.probe_injector = probe_ifindex.map(Injector::new).transpose()?;
+            if let Some(old_br) = old.br_index {
+                self.withdraw_host_neighs_on(old_br).await;
+            }
+        }
 
         if br_changed && old.br_index != new.br_index {
             let what = match (old.br_index, new.br_index) {
@@ -459,11 +470,10 @@ impl Core {
         };
 
         self.injector = Some(Injector::new(snap.up0_index)?);
-        // fwd + offload: an injector on fwd0 for the keepalive probe (toward the vmbr).
-        self.fwd0_injector = match fwd0_index {
-            Some(idx) if self.offload_active() => Some(Injector::new(idx)?),
-            _ => None,
-        };
+        // Aging probes are injected on the guest-facing side: fwd0 enters the operator's
+        // bridge in fwd mode; the bridge master is the correct ingress in direct mode.
+        let probe_ifindex = if self.is_fwd() { fwd0_index } else { snap.br_index };
+        self.probe_injector = probe_ifindex.map(Injector::new).transpose()?;
         self.backend.init(&cfg, self.copy_tx.clone())?;
         self.initialized = true;
         self.snap = snap;
@@ -496,6 +506,7 @@ impl Core {
         self.withdraw_all_host_routes().await;
         self.remove_vmroute_rules().await;
         self.unproxy_all().await;
+        self.withdraw_all_host_neighs().await;
         self.installed.clear(); // kernel state wiped; re-init logs fresh vmroute adds
         if let Some(br) = self.mirrored_br.take() {
             self.clean_mirror_from(br).await;
@@ -507,7 +518,8 @@ impl Core {
             let _ = self.net.link_del_by_name(&self.cli.fwd0()).await;
         }
         self.injector = None;
-        self.fwd0_injector = None;
+        self.probe_injector = None;
+        self.skip_flush_once = false;
         self.initialized = false;
         Ok(())
     }
@@ -583,8 +595,16 @@ impl Core {
             return Ok(());
         }
         let res = self.entries.learn(ip, mac);
-        for ip in res.changed {
+        let changed = res.changed;
+        for ip in changed.iter().copied() {
             self.reconcile(ip).await?;
+        }
+        // A datapath re-learn is a cheap opportunity to repair a neighbour entry that a
+        // host kernel may have garbage-collected while the guest entry stayed alive.
+        if changed.is_empty() {
+            if let Some(guest_mac) = self.entries.get(&ip).map(|e| e.mac) {
+                self.reconcile_host_neighs(ip, guest_mac).await;
+            }
         }
         Ok(())
     }
@@ -601,6 +621,7 @@ impl Core {
         if skip {
             self.backend.withdraw_entry(ip)?;
             self.withdraw_host_route(ip).await;
+            self.withdraw_host_neigh(ip).await;
             self.unproxy_addr(ip).await;
             if self.installed.remove(&ip).is_some() {
                 let reason = if e.is_none() { "expired/evicted" } else { "host-owned" };
@@ -610,6 +631,7 @@ impl Core {
             let mac = e.unwrap().mac;
             self.backend.write_entry(ip, mac)?;
             self.write_host_route(ip).await?;
+            self.reconcile_host_neighs(ip, mac).await;
             self.proxy_addr(ip).await;
             match self.installed.insert(ip, mac) {
                 None => log::info!("vmroute add {ip} -> {mac}{}", self.vmroute_detail(ip)),
@@ -745,6 +767,68 @@ impl Core {
         Ok(())
     }
 
+    /// Keep both sides of fwd-mode host resolution warm. While a guest is first being
+    /// learned, Linux may still have selected the connected up0 route and queue the first
+    /// packet behind an ARP/ND lookup there. Mapping that neighbour to HOSTMAC lets the
+    /// up0 egress demux redirect the queued packet into fwd0; the bridge-side entry uses
+    /// the real guest MAC for subsequent vmroute traffic.
+    async fn reconcile_host_neighs(&mut self, ip: IpAddr, guest_mac: Mac) {
+        if !self.is_fwd() {
+            return;
+        }
+        let hostmac = match self.snap.hostmac {
+            Some(m) => m,
+            None => return,
+        };
+        let mut want = Vec::with_capacity(2);
+        if self.snap.up0_index != 0 {
+            want.push((self.snap.up0_index, hostmac));
+        }
+        if let Some(br) = self.snap.br_index {
+            want.push((br, guest_mac));
+        }
+        for (ifindex, mac) in want {
+            match self.net.neighbour_replace(ifindex, ip, mac).await {
+                Ok(()) => {
+                    self.host_neighs.insert((ifindex, ip), mac);
+                }
+                Err(e) => log::debug!("host-neigh + {ip} on ifindex {ifindex}: {e:#}"),
+            }
+        }
+    }
+
+    async fn withdraw_host_neigh(&mut self, ip: IpAddr) {
+        let keys: Vec<((u32, IpAddr), Mac)> = self
+            .host_neighs
+            .iter()
+            .filter_map(|(key, mac)| (key.1 == ip).then_some((*key, *mac)))
+            .collect();
+        for ((ifindex, ip), expected) in keys {
+            let _ = self.net.neighbour_del_if(ifindex, ip, expected).await;
+            self.host_neighs.remove(&(ifindex, ip));
+        }
+    }
+
+    async fn withdraw_host_neighs_on(&mut self, ifindex: u32) {
+        let keys: Vec<((u32, IpAddr), Mac)> = self
+            .host_neighs
+            .iter()
+            .filter_map(|(key, mac)| (key.0 == ifindex).then_some((*key, *mac)))
+            .collect();
+        for ((idx, ip), expected) in keys {
+            let _ = self.net.neighbour_del_if(idx, ip, expected).await;
+            self.host_neighs.remove(&(idx, ip));
+        }
+    }
+
+    async fn withdraw_all_host_neighs(&mut self) {
+        let keys: Vec<((u32, IpAddr), Mac)> = self.host_neighs.iter().map(|(k, m)| (*k, *m)).collect();
+        for ((ifindex, ip), expected) in keys {
+            let _ = self.net.neighbour_del_if(ifindex, ip, expected).await;
+        }
+        self.host_neighs.clear();
+    }
+
     async fn on_tick(&mut self) -> Result<()> {
         if !self.initialized {
             // A failed init (e.g. transient nft error) is otherwise only retried on the
@@ -753,13 +837,22 @@ impl Core {
             return self.on_netlink_change().await;
         }
         self.aging_tick = self.aging_tick.wrapping_add(1);
-        // Offload keepalive: the timer runs at timeout/2 and alternates probe/flush. On a
-        // probe tick we solicit every proxied guest (ARP/NS via fwd0); a still-present guest
-        // replies → seen refreshed (in OUT) → it survives the flush half a period later, so a
-        // silent-but-present VM keeps its proxy and stays reachable. A released VM never
-        // replies → seen expires → evicted on the flush (~timeout after it goes away).
-        if self.offload_active() && self.aging_tick % 2 == 1 {
-            self.probe();
+        // The probe tick precedes the flush tick. A guest that is still present replies with
+        // ARP/NA, and the existing OUT datapath marks its seen entry immediately. A guest
+        // that does not reply is absent from the next flush result and is withdrawn.
+        if self.aging_tick % 2 == 1 {
+            if let Err(e) = self.probe() {
+                // A failed probe is not evidence that the guest is gone. probe() restores
+                // the liveness marks it can and this flag prevents the next tick from
+                // flushing the round with an incomplete set of requests.
+                self.skip_flush_once = true;
+                return Err(e);
+            }
+            return Ok(());
+        }
+        if self.skip_flush_once {
+            self.skip_flush_once = false;
+            log::warn!("aging: skipping flush after incomplete probe round");
             return Ok(());
         }
         let alive: HashSet<IpAddr> = self.backend.flush()?.into_iter().collect();
@@ -860,16 +953,16 @@ impl Core {
         Ok(())
     }
 
-    /// Solicit every proxied guest on fwd0 (toward the vmbr): an RFC 5227 ACD probe
+    /// Solicit every installed guest on the guest-facing bridge: an RFC 5227 ACD probe
     /// (spa=0.0.0.0) for v4, a DAD-style NS (src=::, no SLLAO) for v6. A present guest
-    /// defends its address; the reply enters fwd0-ingress (OUT path) and refreshes its
-    /// `seen`. The probes are deliberately ADDRESS-ANONYMOUS: this frame is delivered
-    /// inside the guest bridge, where the host's L2 identity is the bridge mac — a
+    /// defends its address; the reply enters the OUT path and refreshes its `seen`. The
+    /// probes are deliberately ADDRESS-ANONYMOUS: this frame is delivered inside the
+    /// guest bridge, where the host's L2 identity is the bridge mac — a
     /// probe with sender = host-ip @ HOSTMAC would repoint every guest's neighbour
     /// entry for the host to HOSTMAC, and the guests' host-bound traffic would then be
     /// MAC-NAT'd out the uplink instead of delivered locally (host<->VM black-holes
     /// until the guest re-ARPs). spa=0 / src=:: give receivers nothing to cache, while
-    /// still soliciting the defense reply the keepalive needs (see afpacket builders).
+    /// still soliciting the defense reply needed to keep the entry alive (see afpacket builders).
     ///
     /// DAD-conflict grace: a guest that JUST produced a control frame is skipped. Its
     /// v6 DAD NS is itself a learn event (target-learned → proxied within ms), so the
@@ -885,12 +978,18 @@ impl Core {
     /// implies the control frame came AFTER the previous flush. A longer grace can
     /// align as flush → (skipped probe) → flush and age out a silent-but-present
     /// guest.
-    fn probe(&mut self) {
-        let Some(inj) = &self.fwd0_injector else { return };
-        let Some(hostmac) = self.snap.hostmac else { return };
+    fn probe(&mut self) -> Result<()> {
+        let Some(inj) = &self.probe_injector else { return Ok(()) };
+        let Some(hostmac) = self.snap.hostmac else { return Ok(()) };
+        if self.installed.is_empty() {
+            return Ok(());
+        }
+        self.backend.arm_probe()?;
         let aging_secs = (self.cli.timeout / 2).max(1); // same period the timer uses
         let grace = Duration::from_secs(aging_secs.min(5)); // 5s covers any DAD window
-        for ip in &self.nd_proxied {
+        let ips: Vec<IpAddr> = self.installed.keys().copied().collect();
+        let mut send_failed = false;
+        for ip in &ips {
             if self
                 .entries
                 .get(ip)
@@ -910,13 +1009,31 @@ impl Core {
             }
             match ip {
                 IpAddr::V4(g) => {
-                    let _ = inj.send_frame(&build_arp_probe(*g, hostmac));
+                    if let Err(e) = inj.send_frame(&build_arp_probe(*g, hostmac)) {
+                        log::warn!("aging probe send {ip}: {e:#}");
+                        send_failed = true;
+                    }
                 }
                 IpAddr::V6(g) => {
-                    let _ = inj.send_frame(&build_ns_dad(*g, hostmac));
+                    if let Err(e) = inj.send_frame(&build_ns_dad(*g, hostmac)) {
+                        log::warn!("aging probe send {ip}: {e:#}");
+                        send_failed = true;
+                    }
                 }
             }
         }
+        if send_failed {
+            // arm_probe() cleared every mark. Keep this round conservative: a send error
+            // must never turn into an eviction, and the following flush is skipped by
+            // on_tick(). Re-assert all entries so a later recovery starts with live state.
+            for ip in ips {
+                if let Err(e) = self.backend.refresh_seen(ip) {
+                    log::warn!("aging probe restore seen {ip}: {e:#}");
+                }
+            }
+            return Err(anyhow!("one or more aging probes failed"));
+        }
+        Ok(())
     }
 
     // ---- fwd host routes ----

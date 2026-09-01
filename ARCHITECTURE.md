@@ -236,7 +236,7 @@ ebpf 速記:`store(off,v)`=`bpf_skb_store_bytes`、`redirect(d)`=`bpf_redirect(d
   - **ebpf(實作修訂)**:TCX 下 `TC_ACT_OK == TCX_PASS` **會終結整條 program chain**(不是只結束本 prog),故 OUT 之後接不到 guard。⇒ ebpf 的 egress_guard **只在 fwd mode 掛**(up0 egress 上單獨一支,攔 `redirect(up0)` 過來的副本);**direct mode 不另掛**——`direct_out` 本身就在 up0 egress,且**每條終結路徑都 inline `store(eth.src,HOSTMAC)`**,等同把 guard 做進去了(case 14「學表故障也不洩漏」對 ebpf 天然成立:inline set 與 ringbuf learn 解耦,learn 掛了 src 照樣正規化)。
   - userspace 補發包 src==HOSTMAC 不命中 → 不迴圈。
 
-- **silent-VM discovery dup(僅 fwd,掛在 up0 egress = ebpf egress_guard / nft guard chain,排在正規化之後)**:解決「VM 靜默配 IP(static、沒 DHCP/DAD/gratuitous)→ 沒 entry、沒 /32·/128 vmroute → host 連 VM 時在 up0 的連線 prefix 上解析 → ARP/NS 送去 gateway 而非 VM → 連不上」。
+- **silent-VM discovery dup(僅 fwd,掛在 up0 egress = ebpf egress_guard / nft guard chain,排在正規化之後)**:解決「VM 靜默配 IP(static、沒 DHCP/DAD/gratuitous)→ 沒 entry、沒 /32·/128 vmroute → host 連 VM 時在 up0 的連線 prefix 上解析 → ARP/NS 送去 gateway 而非 VM → 連不上」；邻居回填与 host egress demux 使学习完成后无需第二次重试。
   - 觀察:datapath OUT 本來就會 learn VM 的 ARP-reply(`spa`)/ NA(target)/ NS。所以只要**讓 host 的查詢觸達 VM**,VM 一回應就被學到、vmroute 就建起來。
   - 演算法(up0 egress,正規化 src 之後):
 
@@ -251,7 +251,7 @@ ebpf 速記:`store(off,v)`=`bpf_skb_store_bytes`、`redirect(d)`=`bpf_redirect(d
     - **v6**:clone 的 `ip6.src` 改 ::、SLLAO type 改成未定義值 200(= DAD NS 形式;RFC 4861 §7.1.1 只拒絕「帶*可辨識* source-lladdr option 的 DAD NS」,未知 option 一律忽略;不能真移除 option——skb 縮短改不動)。持有者以 **NA→ff02::1(all-nodes 多播,帶 TLLAO)** defend → flood 過 fwd0 被學。兩處改寫都在 ICMPv6 csum 覆蓋範圍(src 經 pseudo-header)→ 增量修 csum、clone 後全部還原。
     - **只 clone 廣播 ARP / solicited-node 多播 NS**:unicast NUD probe 本來就到不了 silent guest(kernel 失敗後自己會退回多播解析),而且 host 對 gateway 的週期性 NUD probe 若被 clone,等於**常態性**把 host 位址打進 vmbr(修正前實機上 gateway NUD 就是 v6 下毒源之一)。DAD NS 也要求 dst 是 solicited-node 多播(Linux 對 unicast DAD NS 直接丟),與此限制自洽。
 
-  - 流程:host ARP/NS G(出 up0)→ clone 到 fwd0→fwd1→vmbr→VM → VM 回 ARP-reply/NA(進 fwd0 ingress = OUT)→ **learn G→vmmac**、建 vmroute G/128→br → host **重試**(ping/TCP re-tx)時 /32·/128 比 up0 的連線 prefix 更specific → 改在 br 上解析 → 連上。原查詢那次因回應沒進 host stack 會逾時,靠重試成立(延遲約一個 retry)。
+  - 流程:host ARP/NS G(出 up0)→ clone 到 fwd0→fwd1→vmbr→VM → VM 回 ARP-reply/NA(進 fwd0 ingress = OUT)→ **learn G→vmmac**、建 vmroute G/128→br + host neighbour 回填 → up0 egress demux 將已排隊的 host 包改送 guest → 首包連上。若 neighbour 回填或 demux 不可用,才退回原本靠 ping/TCP retry 的行為。
   - 兩道 guard 互補,各擋一種「不該 clone 的 out 廣播」:
     - `srcip ∈ ip2mac`(已學 guest 的廣播 ARP/NS):純**去重** —— 不擋只是其他 VM 多收一份(VM 多時翻倍),**非正確性問題**。
     - `spa ≠ 0.0.0.0` / `src ≠ ::`(guest 自己的位址探測:ARP ACD probe / DAD NS):探測者 src = 0/::,**永不在 ip2mac**,上一道擋不到 → 必須獨立判,否則**會壞**(非只是多一份)。
@@ -261,33 +261,41 @@ ebpf 速記:`store(off,v)`=`bpf_skb_store_bytes`、`redirect(d)`=`bpf_redirect(d
 
 ### 老化規則(liveness / aging)
 
-out 命中時 `mark(ip)` 標記存活(僅 out)。兩 backend 對 rust 暴露同一介面 `flush()`,rust 每 `--timeout` 秒呼叫一次,回傳當下 kernel 仍存活的 ip 集合:
+out 命中時 `mark(ip)` 標記存活(僅 out)。兩 backend 對 rust 暴露同一介面 `flush()`,rust
+以 `timeout/2` 為 timer tick、每隔一拍呼叫一次 flush,回傳當下 kernel 仍存活的 ip 集合:
 
     nft : mark = `update @seen { ip }`(`@seen` 是 dynamic set 帶 `timeout=--timeout`,每次刷新)
           flush() = 讀 `@seen`(kernel 已自動踢掉 idle>timeout)→ 回傳剩下的
           # 粒度 ≈ timeout(per-entry、kernel 自動)
 
     ebpf: mark = `seen[ip] = 1`(map 無時間老化 → second-chance / clock)
-          flush() = 逐 entry:`seen==1 → seen=0`(存活、再給一輪)、`seen==0 → 刪`(idle 滿一輪)→ 回傳這輪存活的
-          # 粒度 ∈ [timeout, 2×timeout)(每次呼叫推進一格)
+          arm_probe() = 將 seen bit 清 0;guest 回覆在 OUT path 將它設回 1
+          flush() = 逐 entry:`seen==1 → seen=0`(本輪 probe 有回覆)、`seen==0 → 刪`
+          # probe/flush 交替時,無回覆 entry 在下一個 flush 被移除
 
 rust 端不分 backend、統一處理:
 
-    每 --timeout 秒:
+    每個 flush tick(約每 --timeout 秒):
         alive = backend.flush()
         for ip in entries:
             if ip ∉ alive:
                 entries.remove(ip); syncer.notify(ip)   # entries=真相;reconcile 見 entry 沒了 → 撤 kernel
 
-新 entry 的 grace:learn 封包在 kernel 不 mark seen(那時還沒 entry),故 syncer 寫 entry 時**一併初始化 seen=alive**(nft `add @seen {ip}` / ebpf `seen[ip]=1`),給滿一輪 timeout,免首次 flush 前未被 out-hit 就誤刪。
+新 entry 的 grace:learn 封包在 kernel 不 mark seen(那時還沒 entry),故 syncer 寫 entry 時**一併初始化 seen=alive**(nft `add @seen {ip}` / ebpf `seen[ip]=1`),避免在第一次 probe/flush 前被誤刪。
 
-**offload 模式的 keepalive(probe / flush 交替)**:offload 下 entry 被踢 → up0 proxy 被移除 → 上游(APF)再也解析不到該 guest,且**無重探路徑**(APF 直接答/丟 gw 的 NS,不會 flood 到 bridge;不像 plain fwd 靠 flood / discovery dup 自癒)。但靜默-但-仍持有-IP 的 guest 不該被踢。故 offload 啟用時 aging 改成:
+**aging probe / flush 交替**:entry 老化前先問 guest 是否仍在場,所以不再因 guest 靜默而
+直接撤銷。所有 mode 都使用:
 
-    timer 週期 = timeout/2,交替 probe / flush(probe 一拍、flush 下一拍,相差 timeout/2):
-      probe 拍:對每個 proxied guest 由 **fwd0 注入**(userspace AF_PACKET,**非 ebpf**——nft 路線同樣可用)一個
-                **位址匿名探測**:v4 = RFC 5227 ACD probe(ARP-request,`spa=0.0.0.0`、sha=HOSTMAC)、
-                v6 = DAD 式 NS(`src=::`、**無 SLLAO**、dst=solicited-node 多播),送進 vmbr。
-      flush 拍:同上「每 timeout 秒」的老化(此時距上次 probe 才 timeout/2)。
+    timer 週期 = timeout/2,交替 probe / flush(probe 一拍、flush 下一拍):
+      probe 拍:對每個已安裝 entry 發一個**位址匿名探測**(userspace AF_PACKET):
+                fwd mode 從 **fwd0** 注入進 vmbr;direct mode 從 bridge master 注入;
+                v4 = RFC 5227 ACD probe(ARP-request,`spa=0.0.0.0`、sha=HOSTMAC)、
+                v6 = DAD 式 NS(`src=::`、**無 SLLAO**、dst=solicited-node 多播)。
+      flush 拍:讀取 backend 的 `seen`;探測回覆沿既有 OUT 路徑 mark `seen`,仍存活;
+                沒有回覆的 entry 才從 userspace `entries` 移除並撤銷 demux / vmroute / proxy。
+
+    nft 的 `seen` 是 timeout set,回覆會直接延長其期限;ebpf 的 seen 是 second-chance bit,
+    因此 backend 各自保留原有的 liveness 粒度。`--timeout` 仍是探測與 flush 的基準週期。
 
     ⚠ probe **絕不能帶 host IP 當 sender**(修正前的實機事故):它被投遞在 bridge 段,guest 會按 RFC 826/4861
       從 request 的 sender 欄位更新鄰居快取 → guest 的 host-ip 項被釘成 HOSTMAC(bridge 段正確身分是 br mac)
@@ -311,10 +319,11 @@ rust 端不分 backend、統一處理:
       ebpf 冪等設 1)⇒ 「skip ⇒ seen 剛刷新」,餘裕恆為整個 flush→probe 間隔,不再依賴 timer 準時。
 
     - guest 仍持有 IP → defend:v4 回 unicast ARP-reply 到 sha=HOSTMAC、v6 回 **NA→ff02::1**(多播,帶 TLLAO)
-      → 都進 fwd0 ingress(OUT path)→ `mark(seen)`(nft `update @seen` / ebpf `seen=1`,和一般 guest 流量同路徑;
+      → 都進 guest-facing OUT hook→ `mark(seen)`(nft `update @seen` / ebpf `seen=1`,和一般 guest 流量同路徑;
       **已確認 ARP-reply 用 spa、NA 用 target/saddr 都會 mark**)→ flush 時仍存活 → **不被踢**(proxy 續命)。
-    - guest 釋放了 IP → 不回應 probe → seen 自然過期 → ~timeout 後 flush 踢掉、proxy 移除。
-    - 只 probe **proxied**(`nd_proxied`)entry;plain fwd / direct 不開 probe(維持每 timeout 一次 flush,無多餘 ARP/NS)。
+    - guest 釋放了 IP → 不回應 probe → seen 自然過期 → 後續 flush 踢掉、proxy 移除。
+    - probe 目標是所有已安裝 entry,不只 `nd_proxied`;因此 plain fwd / direct 的靜默 guest
+      也會先收到 ARP/NS 詢問,只有無回應才老化。
 
 ---
 
@@ -384,6 +393,35 @@ nft 用一條 `NFLOG prefix "A"` 規則做相同的 target-map 過濾。Rust 收
 只是重複同一正確 mapping。`src == HOSTMAC` 的 ingress 反射 guard 會丟棄 AP hairpin
 回來的 proxy reply。若 APF/firmware 在 up0 之前丟掉 ARP,軟體看不到該 request,仍需
 `--arp-keepalive 10` 避免上游重新發起解析。
+
+### host 首包邻居回填与 demux
+
+`host -> guest` 的第一包可能在 guest 尚未学习时先按 up0 的 connected route 发起
+ARP/ND。发现 probe 的回复随后才让 syncer 安装 guest entry；如果只安装 table 200
+的 vmroute，原先排队的包仍可能留在 `wlan0` 的 `FAILED` neighbour 队列中，必须等重试。
+因此 fwd 模式在每次 `reconcile(ip)` 同步两条由 pbridge 自己维护的邻居项:
+
+```
+up0 : guest-ip -> HOSTMAC       # 唤醒/完成 up0 上原先排队的解析
+br  : guest-ip -> guest-MAC    # 后续 /32-/128 vmroute 的二层解析
+```
+
+两项都以 `NUD_REACHABLE` 写入，并保存 `(ifindex, ip) -> expected-mac`。guest 被撤销、
+bridge 换绑或 session teardown 时，先读取当前 link-layer address，只有仍等于
+`expected-mac` 才删除，避免误删用户后来替换的 neighbour。
+
+邻居回填后，up0 egress 仍需处理已经选中 up0 route 的 host 数据包:
+
+```
+if locally-originated && ip.dst ∈ ip2mac:
+    ether.dst = ip2mac[ip.dst]
+    redirect(fwd0)
+```
+
+eBPF 用 `skb->ingress_ifindex == 0` 区分 host 本地包；nft 用 `ip.src ∈ host4/host6`
+做等价过滤。重定向包在 fwd0 OUT 侧放行已知 guest 目标，其他 `HOSTMAC` bridge
+flood 仍由原有 guard 丢弃。这样首个 host ping 不再依赖第二次重试；guest 尚未学习
+时仍由 discovery ARP/NS probe 触发学习。
 
 ### host → VM 路由
 
@@ -483,7 +521,7 @@ syncer 是**唯一寫/撤 kernel offload 狀態的人**。維護兩份 state、�
 三類事件:
 
     notify(ip)          (packet processor)  → reconcile(ip)
-    timer(--timeout)                        → flush 老化(見 §老化規則)
+    timer(--timeout/2)                      → probe / flush 交替(見 §老化規則)
     netlink link/addr   (kernel-side 變)    → recompute + diff(下)
 
 **netlink → recompute + diff(level-triggered)** —— netlink 噪音多,先過濾出碰到 `up0 / up0.master / fwd1 / fwd1.master` 的才動:
@@ -520,9 +558,9 @@ syncer 是**唯一寫/撤 kernel offload 狀態的人**。維護兩份 state、�
     reconcile(ip) write    : backend.write_entry(ip,mac)= ip2mac/valid + seen=alive
                              (fwd 且非 link-local 且 --vmroute-table≠-1) route_add(ip/{32|128} dev=br_index,prefsrc=select_src(ip,host_ips),table=vmroute-table)
                              (offload-workaround,fwd) proxy(ip)= addr_add_tagged(up0, ip/{32|128}, metric=magic, noprefixroute,[nodad,deprecated])
-    reconcile(ip) withdraw : backend.withdraw_entry(ip) + (fwd) route_del(ip,vmroute-table) + (workaround) unproxy(ip)= addr_del(up0,ip)
+    reconcile(ip) withdraw : backend.withdraw_entry(ip) + (fwd) route_del(ip,vmroute-table) + (fwd) neighbour_del_if(up0/br, expected-mac) + (workaround) unproxy(ip)= addr_del(up0,ip)
     reconcile_mirror()     : addr_add/del 於 br(global+fe80,noprefixroute nodad);apply/restore_bridge_cfg(addr_gen_mode/accept_ra)
-    teardown               : withdraw_all_host_routes + unproxy_all(撤所有 up0 proxy 位址)+ clean_mirror + restore_bridge_cfg
+    teardown               : withdraw_all_host_routes + withdraw_all_host_neighs + unproxy_all(撤所有 up0 proxy 位址)+ clean_mirror + restore_bridge_cfg
                              + backend.teardown + (fwd) link_del(fwd0)(連帶刪 veth pair)
     # 唯一寫 route 的是 fwd 的 per-guest /32·/128(table=--vmroute-table,預設專用 table 200,scope link,prefsrc=host 同段 IP);direct 不寫(VM 經 br connected route on-link)。
     #   這條 vmroute **只給本機發起(host→guest)的流量用**:外部流量一律由 ebpf/nft 的 IN demux 在 tc-ingress 就 redirect 進 bridge 走 switching,根本不過 routing table。
@@ -735,7 +773,7 @@ on_arp_keepalive():
 | 4 | ND 出/入 | NS/NA/RS 出向改 LLA=HOSTMAC + csum 正確;RA 不改 router 真 LLA;solicited RA 經 in demux 回 guest |
 | 5 | guest 換 IP | 新 ip 首包學進表、連通;舊 ip 過 timeout 從 ip2mac/valid/seen 消失 |
 | 6 | guest 換 MAC | miss 包進 userspace、短時間 ip2mac/valid 更新;入向改送 new mac;連通不中斷 |
-| 7 | timeout / eviction | 靜默 > timeout → entry 移除;再發話重新學 |
+| 7 | timeout / eviction | probe 前詢問 guest;有 ARP/NA 回覆則保留,無回覆才移除;再發話重新學 |
 | 8 | guest 隔離 + 多 guest | g1↔g2 的 unicast 流量(bridge FDB 學成後)不經 up0;broadcast ARP / FDB 未學前的 flood 副本會出現在 up0 屬預期(其 src 仍須 == HOSTMAC);各自身分正確、回程分別送達 |
 | 9 | host 共存 | host 自身 DHCP/ARP/ping/SSH 上游全程正常(`host_ips` 排除、DHCP chaddr 還本機、gateway ARP 收得到) |
 | 10 | host↔VM 路由 | direct 零路由通;fwd 鏡像 + /32//128 通(v4+v6 雙向、含 secondary、LL 用 -I) |
@@ -744,11 +782,11 @@ on_arp_keepalive():
 | 13 | **出向零洩漏** | `tcpdump -e up0` 整段:**所有** frame src mac == HOSTMAC,零例外;egress_guard counter 可非 0(定義見 §backend 原語對應) |
 | 14 | **學表故障也不洩漏** | 停掉 copy/learn handler 後 guest 發包:連通可中斷,但對端**仍**看不到 foreign src(安全網與學表解耦) |
 | 15 | fast-path 不進 userspace | 學表後 iperf3:吞吐高、copy/NFLOG 計數幾乎不增(data 留 kernel) |
-| 16 | host→**靜默** VM discovery(僅 fwd) | VM 配 static IP、完全不發包 → host 連 VM:up0-egress discovery dup 把 host 的 ARP/NS clone 到 fwd0 → VM 回應被學、vmroute 建起 → 重試連上(`func-silent-vm.sh`,nft+ebpf) |
+| 16 | host→**靜默** VM discovery(僅 fwd) | VM 配 static IP、完全不發包 → host 連 VM:up0-egress discovery dup 把 host 的 ARP/NS clone 到 fwd0 → VM 回應被學、vmroute + host neighbour 建起 → 首包連上(`func-silent-vm.sh`,nft+ebpf) |
 | 17 | offload keepalive(僅 offload) | timeout=5、guest 發包後**靜默 15s**:keepalive probe(timeout/2 週期、fwd0 注入)讓 proxied entry 不被踢 → entry 仍在、**gw→guest 仍通**;guest 釋放 IP 後 ~timeout 被踢、gw→guest 轉不通(`func-offload-workaround.sh` Phase C + `func-offload-keepalive.sh`,nft 含 bpf-blocked) |
 | 18 | ARP keepalive(`--arp-keepalive`) | 等價場景模擬韌體單 v4 slot:**gw egress 只放行 `tpa==host` 的 ARP request、其餘丟**;host↔gw 先通訊建鄰居表;guest 持 permanent gw neigh(不重 ARP 的窗口)。斷言:off → guest↔gw v4 死、gw entry FAILED;`--arp-keepalive 2` → 恢復(單播 reply 解開 FAILED entry),guest **靜默 10s 後** gw entry 仍 REACHABLE、gw→guest 100% 通(`func-arp-keepalive.sh`,nft bpf-blocked + ebpf) |
 | 19 | **反射自我封包 guard** | 從上游注入「AP 反射」形式的自我 GARP(`src==HOSTMAC`、guest-ip is-at HOSTMAC)→ **不得**進 vmbr:host 的 guest 鄰居項不被 override、host↔VM 前後皆 100% 通(`reflected_garp_no_poison`;另 apf/qcom 單元全程以 upsim `--reflect` 跑,所有案例都在「AP 會反射」條件下驗證) |
-| 20 | **probe 位址匿名**(僅 offload) | vmport 抓包一個 probe 週期:probe 必為 ACD 形式(`tell 0.0.0.0`)/ DAD 形式(`src=::`),**不得**帶 host IP 當 sender;guest 的 host 鄰居項不被釘成 HOSTMAC;host↔VM 跨 probe 週期 100% 通(`probe_no_poison`) |
+| 20 | **probe 位址匿名** | vmport 抓包一個 probe 週期:probe 必為 ACD 形式(`tell 0.0.0.0`)/ DAD 形式(`src=::`),**不得**帶 host IP 當 sender;guest 的 host 鄰居項不被釘成 HOSTMAC;host↔VM 跨 probe 週期 100% 通(`probe_no_poison`) |
 | 21 | **discovery clone 位址匿名**(僅 fwd) | host 解析未知位址時,guest 側抓包看到的 clone 必為 `tell 0.0.0.0` / `src=::` 形式,**不得**出現 host-ip 當 sender(`discovery_clone_anonymous`) |
 
 額外功能腳本(矩陣外、各自 nft+ebpf):`func-silent-vm.sh`(案例 16)、`func-offload-workaround.sh`(`--offload-workaround` / `fwd-with-offload`:apfsim 模擬 APF,gateway→guest off→fail/on→pass + proxy 機制斷言 + Phase C keepalive 案例 17)、`func-offload-keepalive.sh`(案例 17 位址層 + 釋放→踢除,nft 跑在 bpf()-blocked seccomp 下證明 probe 無需 ebpf)、`func-arp-keepalive.sh`(案例 18,§ARP keepalive)。

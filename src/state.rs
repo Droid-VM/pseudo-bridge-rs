@@ -17,7 +17,7 @@ pub struct Entry {
     pub mac: Mac,
     pub createat: u64,
     /// When this ip last produced a control-plane copy (ARP/ND learn event, including
-    /// no-op re-learns). The offload keepalive probe consults it: a guest whose DAD NS
+    /// no-op re-learns). The aging probe consults it: a guest whose DAD NS
     /// just arrived is mid-DAD, and probing it with our DAD-form NS within that window
     /// reads as an address conflict (RFC 4862) — the guest would abort the address.
     pub last_ctrl: Instant,
