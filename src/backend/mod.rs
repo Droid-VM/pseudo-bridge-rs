@@ -43,6 +43,22 @@ pub(crate) fn push_copy(tx: &Sender<CopyEvent>, ev: CopyEvent, dropped: &mut u64
     }
 }
 
+/// Someone other than pbridge drove the driver's APF vendor command, so the firmware's
+/// APF program may no longer carry our rules. Carries the caller's TGID for logging only.
+///
+/// Deliberately NOT a `CopyEvent`: the copy queue is lossy by design (a dropped learn is
+/// re-learned by the next packet), but a dropped overwrite notification would leave guest
+/// ICMP broken until the *next* unrelated APF install. Its channel is depth-1 and a full
+/// channel is a no-op, which coalesces bursts instead of dropping the last one.
+#[derive(Debug, Clone, Copy)]
+pub struct ApfExternalWrite {
+    pub tgid: u32,
+}
+
+/// Depth-1: one pending "the APF program changed" flag is all the core needs. Anything
+/// more just makes it run the same transaction twice.
+pub const APF_QUEUE_DEPTH: usize = 1;
+
 /// A learn event surfaced from the kernel copy path.
 #[derive(Debug)]
 pub enum CopyEvent {
@@ -80,6 +96,10 @@ pub struct InitCfg {
     pub hostmac: Mac,
     pub brmac: Option<Mac>,
     pub host_ips: Vec<IpAddr>,
+    /// ebpf only: load + attach the APF-overwrite kprobe. False keeps the BPF session
+    /// byte-identical to before this feature existed (no extra program, no extra map
+    /// content, no extra kernel permissions needed).
+    pub apf_watchdog: bool,
 }
 
 /// The kernel offload datapath. All methods are synchronous; the core calls them
@@ -89,7 +109,14 @@ pub trait Backend: Send {
 
     /// Install chains/progs + maps/sets, program HOSTMAC/BRMAC/host_ips, and spawn
     /// the copy reader (pushing to `copy_tx` via the lossy `push_copy`).
-    fn init(&mut self, cfg: &InitCfg, copy_tx: Sender<CopyEvent>) -> Result<()>;
+    ///
+    /// `apf_tx` is `Some` iff `cfg.apf_watchdog`; only the ebpf backend supports it.
+    fn init(
+        &mut self,
+        cfg: &InitCfg,
+        copy_tx: Sender<CopyEvent>,
+        apf_tx: Option<Sender<ApfExternalWrite>>,
+    ) -> Result<()>;
 
     /// Remove all kernel state for this session (back to uninitialized).
     fn teardown(&mut self) -> Result<()>;

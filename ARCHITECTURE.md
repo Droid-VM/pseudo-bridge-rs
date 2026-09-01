@@ -86,6 +86,73 @@ multi-guest 共用一個「只認得單一 mac」的上游口(Wi-Fi STA、或被
       ⇒ userspace 讀 copy 要分兩路:有 HWHEADER → 取 L3+HWHEADER;無 → payload 即 frame,自 payload[6..12] 取 guest mac、payload[14..] 取 L3。
     - **reinject vs learn-only 用 `log prefix` 分流**:ND-drop 路徑寫 `prefix "R"`(userspace fix_csum + AF_PACKET 補發 + learn),ARP / 未學 IP / DAD-NS 等轉發路徑寫 `prefix "L"`(只 learn)。否則 userspace 無法區分「被 drop 要補發的 ND」與「已 in-kernel 轉發、只需 learn 的包」。
 
+### APF ICMP watchdog（顯式 opt-in，僅 `-e ebpf`）
+
+`--offload-workaround` 解的是 ARP/NS「目標非 local address」問題；它**不**改 APF 中另
+一個小米 vendor 分支。實機的 APF 程式有以下無條件 IPv4 ICMP echo-request drop（手機
+自身 IP 和 guest 都命中；TCP/UDP 不受影響）：
+
+```text
+ldb r0,[23] / jne r0,1 / ldb r0,[34] / jne r0,8 / drop counter=21
+```
+
+當且僅當操作者傳至少一個 `--apf-watchdog-guest <IPv4>`（可重複、最多 8 個、IPv4 only）
+時，pbridge 啟用 watchdog。這是固定、排序後的 allow-list，**不從動態 learn/aging
+entries 推導**：放行 inbound ICMP 是輸入面擴張，必須由操作者明確指定。空列表不載入
+kprobe、不填 watchdog map，原本 eBPF session 的 BPF 權限/行為不變；nft、IPv6、重複值、
+第 9 個值都在啟動前報錯，絕不退化成 polling。
+
+```text
+BPF kprobe: wlan_hdd_cfg80211_apf_offload
+    │  enabled==0 或 caller TGID==pbridge TGID → return
+    └─ 其餘呼叫 → shared events ringbuf { kind=ApfExternalWrite, tgid }
+                                  │
+Core single-writer actor             │ depth-1 coalescing channel
+    │                                 └─ debounce 200ms（可調）
+    └─ disable → READ 2048-byte work memory → derive stock program length
+       → locate / patch / static-validate → WRITE → READ patched length → byte compare
+       → ENABLE（任何成功/錯誤/unwind 路徑皆盡力 enable）
+```
+
+**偵測**：`wlan_hdd_cfg80211_apf_offload` 是 qcacld 的唯一 packet-filter vendor-command
+入口，故同時覆蓋 legacy SET、APF 3.0 WRITE/READ、enable/disable。probe 刻意不讀函式
+參數/不猜子命令；它只用 helper 14 `bpf_get_current_pid_tgid`，所以不依賴 KASLR/module
+symbol address。實測目前 NetworkStack 的 `installPacketFilter` 觸發此入口但**沒有**觸發
+`wmi_send_apf_write_work_memory_cmd_tlv`，即目前走 legacy SET；watchdog 則使用 APF 3.0
+work-memory READ/WRITE，因為唯有此通道可從 firmware readback 最終 bytes。pbridge 自己的
+disable/read/write/enable 被 own-TGID 濾掉，避免自激循環；任一外部 call 都只代表「重新
+檢查」，由 debounce 合併 NetworkStack 一次邏輯更新的多個 vendor calls。
+
+**程式來源與安全 patch**：READ 回的是固定 2048-byte work memory，不能把它全當 bytecode。
+walker 從唯一 `debugbuf` 指令推導 `program_len + debugbuf == 1744`（本裝置 2048-byte APF
+RAM 減固定 304-byte counter area），重新 walk 至剛好 program end，並驗證所有 jump target、
+尾端 vendor PASS template 與 counter budget；未知/truncated/歧義 layout 一律不寫。只接受
+唯一的上述 `DROPPED_ICMP_ECHO` pattern。於 drop 前插入 `ldw r0,[30]`（2 bytes）及每 guest
+一條 `jeq r0,<guest>,PASS`（9 bytes），總計 `2 + 9*N`（N=8 時 74）。每個滿足
+`end <= insertion_point <= target` 的 forward jump immediate 加 delta（`end == point` 也算），
+並從 debugbuf 減 delta；jump field overflow、debugbuf 不足或超 budget 都拒絕。成功 WRITE 後
+必 READ 相同長度且逐 byte compare；不一致不報成功。
+
+**併發/生命週期**：ringbuf 的 learn copy 可以 lossy；APF event 不可以，所以它單獨走
+capacity-1 channel（滿只表示已有 pending recheck，安全合併）。所有 transaction 都在既有
+Core single-writer actor，故不會和 link reconciliation、entry mutation 或 teardown 並發。session
+init 順序為 map self-TGID → attach kprobe → TC hooks/backend ready → Core 接受 event → 初次
+repatch；任何 map/load/attach（含缺少 Qualcomm symbol）失敗都使啟動失敗，而不是「看似啟用」。
+teardown 先停止 watchdog/socket，再 drop backend（kprobe/TC links 自動 detach）；尾隨 event
+不會重裝。transaction 中再有 external event 時 channel 保留一個標誌，transaction 後再跑一次；
+連續失敗走 1/2/5/10/30 s 退避，且每次失敗都保持/恢復 APF enabled。
+
+**cold-start discovery**：watchdog allow-list 只有 IPv4、沒有 guest MAC，不能把它偽造成
+`ip2mac` entry。重啟後在 hooks、`fwd0`、guest-facing bridge 已 ready、但 `installed` 仍空時，
+Core 立即對每個 explicit 且未 learned address 往 `probe_injector` 送 RFC 5227 匿名 ARP probe
+（L2 broadcast、`spa=0.0.0.0`、`tpa=guest`）；online guest 的 defense/reply 走正常 OUT hook，
+才由真實 `eth.src` 建立 binding / route / neighbour / proxy。前 5 秒每秒重送，之後僅每 30 秒
+對仍未 learned 的 explicit guest 重送；一旦 learned 即停止，改由既有 aging probe 保活。此機制
+不掃描子網、不從 dynamic entries 擴大 allow-list、不假設 static MAC。
+
+> 這是 Qualcomm/Xiaomi device-specific optional feature，並非一般 pseudo-bridge
+> datapath 的前提。詳細實測脈絡和 acceptance checks 見 `../apf/APF_WATCHDOG_DESIGN.md`。
+
 ### 轉發效能 / 為何不用 AF_XDP
 
     tc fwd(bpf_redirect)  : skb-level redirect,搬 skb 不複製 payload(zero-copy);改 mac 只寫 6 bytes header

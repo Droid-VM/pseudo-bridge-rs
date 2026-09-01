@@ -3,6 +3,7 @@
 //! (nft or ebpf) and learns guest ip→mac bindings from a copy path.
 
 mod afpacket;
+mod apf;
 mod backend;
 mod cli;
 mod core;
@@ -17,6 +18,9 @@ use cli::Cli;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Fail before logging/initialising anything for an unsupported watchdog combination
+    // (notably `-e nft`): there is intentionally no polling fallback for this feature.
+    crate::cli::validate_apf_watchdog(&cli).map_err(anyhow::Error::msg)?;
     // --loglevel sets the default filter; RUST_LOG (if set) still overrides it.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(cli.loglevel.clone()))
         .format_timestamp_millis()
@@ -24,7 +28,7 @@ fn main() -> Result<()> {
 
     log::info!(
         "pbridge start: if={} engine={:?} mode={:?} bridge={:?} fwd0={} fwd1={} nflog-group={} timeout={}s \
-         offload-workaround={:?} arp-keepalive={}s loglevel={}",
+         offload-workaround={:?} arp-keepalive={}s apf-watchdog-guests={:?} apf-watchdog-debounce={}ms loglevel={}",
         cli.interface,
         cli.engine,
         cli.mode,
@@ -35,6 +39,8 @@ fn main() -> Result<()> {
         cli.timeout,
         cli.offload_workaround,
         cli.arp_keepalive,
+        cli.apf_watchdog_guest,
+        cli.apf_watchdog_debounce_ms,
         cli.loglevel,
     );
 

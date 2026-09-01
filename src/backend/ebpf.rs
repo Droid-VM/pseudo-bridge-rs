@@ -1,12 +1,12 @@
 //! ebpf backend: loads the BPF datapath (build.rs object) with aya, attaches tc
 //! programs, manages maps, and reads learn tuples from a ringbuf. Zero nft.
 
-use super::{push_copy, Backend, CopyEvent, InitCfg};
+use super::{push_copy, ApfExternalWrite, Backend, CopyEvent, InitCfg};
 use crate::cli::Mode;
 use crate::types::Mac;
 use anyhow::{anyhow, Context, Result};
 use aya::maps::{Array, HashMap as AyaHashMap, MapData, RingBuf};
-use aya::programs::{tc, SchedClassifier, TcAttachType};
+use aya::programs::{tc, KProbe, SchedClassifier, TcAttachType};
 use aya::{Ebpf, EbpfLoader};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsRawFd;
@@ -37,6 +37,22 @@ struct Cfg {
 // no padding (it's byte-copied to/from BPF map memory). Cfg holds only u8/array/u32 fields,
 // and the explicit `pad: [u8; 3]` aligns `up0_ifx` so there is no implicit padding.
 unsafe impl aya::Pod for Cfg {}
+
+/// Mirrors `struct wdcfg` in bpf/pbridge.bpf.c. Separate from `Cfg` on purpose: the
+/// datapath's config map has a fixed ABI and is read per packet.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WdCfg {
+    enabled: u32,
+    self_tgid: u32,
+}
+// SAFETY: two u32 fields, `#[repr(C)]`, no padding — valid for any bit pattern.
+unsafe impl aya::Pod for WdCfg {}
+
+/// The driver's only entry point for QCA_NL80211_VENDOR_SUBCMD_PACKET_FILTER. Covers
+/// legacy SET (what NetworkStack uses today), APF 3.0 WRITE/READ, and enable/disable.
+const APF_KPROBE_SYMBOL: &str = "wlan_hdd_cfg80211_apf_offload";
+const APF_KPROBE_PROG: &str = "apf_offload_probe";
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -96,8 +112,18 @@ impl Backend for EbpfBackend {
         "ebpf"
     }
 
-    fn init(&mut self, cfg: &InitCfg, copy_tx: Sender<CopyEvent>) -> Result<()> {
-        let mut ebpf = EbpfLoader::new().load(bpf_obj()).context("load bpf object")?;
+    fn init(
+        &mut self,
+        cfg: &InitCfg,
+        copy_tx: Sender<CopyEvent>,
+        apf_tx: Option<Sender<ApfExternalWrite>>,
+    ) -> Result<()> {
+        if cfg.apf_watchdog != apf_tx.is_some() {
+            return Err(anyhow!("apf watchdog config and channel disagree"));
+        }
+        let mut ebpf = EbpfLoader::new()
+            .load(bpf_obj())
+            .context("load bpf object")?;
 
         self.cur = Cfg {
             hostmac: cfg.hostmac.0,
@@ -138,6 +164,43 @@ impl Backend for EbpfBackend {
             }
         }
 
+        // APF watchdog: fill the config map BEFORE attaching, so the probe can filter our
+        // own vendor commands from its very first invocation. Any failure here is fatal —
+        // a silently unarmed watchdog looks enabled but never detects an overwrite.
+        if cfg.apf_watchdog {
+            let self_tgid = std::process::id();
+            {
+                let map = ebpf
+                    .map_mut("apf_wd")
+                    .ok_or_else(|| anyhow!("no apf_wd map"))?;
+                let mut arr: Array<&mut MapData, WdCfg> = Array::try_from(map)?;
+                arr.set(
+                    0,
+                    WdCfg {
+                        enabled: 1,
+                        self_tgid,
+                    },
+                    0,
+                )
+                .context("write apf_wd map")?;
+            }
+            let p: &mut KProbe = ebpf
+                .program_mut(APF_KPROBE_PROG)
+                .ok_or_else(|| anyhow!("no prog {APF_KPROBE_PROG}"))?
+                .try_into()?;
+            p.load().context("load apf kprobe")?;
+            p.attach(APF_KPROBE_SYMBOL, 0).with_context(|| {
+                format!(
+                    "attach kprobe to {APF_KPROBE_SYMBOL} (is this a Qualcomm qcacld build \
+                     with APF support?)"
+                )
+            })?;
+            log::info!(
+                "apf-watchdog: kprobe on {APF_KPROBE_SYMBOL} armed (self tgid {self_tgid} filtered \
+                 in-kernel)"
+            );
+        }
+
         // host maps
         self.ebpf = Some(ebpf);
         self.cfg = Some(cfg.clone());
@@ -147,7 +210,7 @@ impl Backend for EbpfBackend {
         let ring_map = self.ebpf()?.take_map("events").ok_or_else(|| anyhow!("no events map"))?;
         let ring: RingBuf<MapData> = RingBuf::try_from(ring_map)?;
         let stop = Arc::new(AtomicBool::new(false));
-        spawn_ringbuf_reader(ring, stop.clone(), copy_tx);
+        spawn_ringbuf_reader(ring, stop.clone(), copy_tx, apf_tx);
         self.reader_stop = Some(stop);
         Ok(())
     }
@@ -174,10 +237,26 @@ impl Backend for EbpfBackend {
 
     fn set_host_ips(&mut self, ips: &[IpAddr]) -> Result<()> {
         // rewrite host4/host6 to match `ips`.
-        let want4: std::collections::HashSet<u32> =
-            ips.iter().filter_map(|ip| if let IpAddr::V4(a) = ip { Some(v4key(*a)) } else { None }).collect();
-        let want6: std::collections::HashSet<In6> =
-            ips.iter().filter_map(|ip| if let IpAddr::V6(a) = ip { Some(In6 { a: a.octets() }) } else { None }).collect();
+        let want4: std::collections::HashSet<u32> = ips
+            .iter()
+            .filter_map(|ip| {
+                if let IpAddr::V4(a) = ip {
+                    Some(v4key(*a))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let want6: std::collections::HashSet<In6> = ips
+            .iter()
+            .filter_map(|ip| {
+                if let IpAddr::V6(a) = ip {
+                    Some(In6 { a: a.octets() })
+                } else {
+                    None
+                }
+            })
+            .collect();
         {
             let map = self.ebpf()?.map_mut("host4").ok_or_else(|| anyhow!("no host4"))?;
             let mut h: AyaHashMap<&mut MapData, u32, u8> = AyaHashMap::try_from(map)?;
@@ -342,12 +421,18 @@ impl Backend for EbpfBackend {
     }
 }
 
-fn spawn_ringbuf_reader(mut ring: RingBuf<MapData>, stop: Arc<AtomicBool>, tx: Sender<CopyEvent>) {
+fn spawn_ringbuf_reader(
+    mut ring: RingBuf<MapData>,
+    stop: Arc<AtomicBool>,
+    tx: Sender<CopyEvent>,
+    apf_tx: Option<Sender<ApfExternalWrite>>,
+) {
     std::thread::Builder::new()
         .name("ringbuf-reader".into())
         .spawn(move || {
             let fd = ring.as_raw_fd();
             let mut dropped = 0u64;
+            let mut coalesced = 0u64;
             loop {
                 if stop.load(Ordering::SeqCst) {
                     break;
@@ -361,21 +446,60 @@ fn spawn_ringbuf_reader(mut ring: RingBuf<MapData>, stop: Arc<AtomicBool>, tx: S
                 }
                 while let Some(item) = ring.next() {
                     let d: &[u8] = &item;
-                    let Some(ev) = parse_ring_event(d) else {
-                        continue;
-                    };
-                    push_copy(&tx, ev, &mut dropped);
+                    match parse_ring_event(d) {
+                        Some(KernelEvent::Copy(ev)) => push_copy(&tx, ev, &mut dropped),
+                        Some(KernelEvent::Apf(ev)) => {
+                            // Depth-1 channel: Full means a notification is already
+                            // pending, which is the same instruction ("recheck the APF
+                            // program") — coalescing it is correct, not a loss.
+                            if let Some(atx) = &apf_tx {
+                                use tokio::sync::mpsc::error::TrySendError;
+                                match atx.try_send(ev) {
+                                    Ok(()) | Err(TrySendError::Closed(_)) => {}
+                                    Err(TrySendError::Full(_)) => {
+                                        coalesced += 1;
+                                        if coalesced.is_power_of_two() {
+                                            log::debug!(
+                                                "apf-watchdog: {coalesced} notifications coalesced \
+                                                 into an already-pending repatch"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None => continue,
+                    }
                 }
             }
         })
         .expect("spawn ringbuf reader");
 }
 
-fn parse_ring_event(d: &[u8]) -> Option<CopyEvent> {
+/// What the shared ringbuf can carry. One reader, one fd, one stop protocol; the event
+/// `kind` byte discriminates. Kinds 0/1 are the pre-existing 24-byte `copy_evt` ABI and
+/// must keep parsing exactly as before.
+enum KernelEvent {
+    Copy(CopyEvent),
+    Apf(ApfExternalWrite),
+}
+
+fn parse_ring_event(d: &[u8]) -> Option<KernelEvent> {
     if d.len() < 24 {
         return None;
     }
+    // kind 2 has no MAC (the kprobe has no packet); its payload is the caller's TGID.
+    if d[6] == 2 {
+        return Some(KernelEvent::Apf(ApfExternalWrite {
+            tgid: u32::from_ne_bytes([d[8], d[9], d[10], d[11]]),
+        }));
+    }
     let mac = Mac::from_slice(&d[0..6])?;
+    let ev = parse_copy_event(d, mac)?;
+    Some(KernelEvent::Copy(ev))
+}
+
+fn parse_copy_event(d: &[u8], mac: Mac) -> Option<CopyEvent> {
     match (d[6], d[7]) {
         (0, 4) => Some(CopyEvent::Learn {
             ip: IpAddr::V4(Ipv4Addr::new(d[8], d[9], d[10], d[11])),
@@ -410,16 +534,107 @@ mod parse_test {
             2, 0, 0, 0, 0, 1, 1, 4, 10, 0, 0, 5, 10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         match super::parse_ring_event(&d) {
-            Some(CopyEvent::ArpRequest {
+            Some(super::KernelEvent::Copy(CopyEvent::ArpRequest {
                 guest_ip,
                 requester_ip,
                 requester_mac,
-            }) => {
+            })) => {
                 assert_eq!(guest_ip, Ipv4Addr::new(10, 0, 0, 5));
                 assert_eq!(requester_ip, Ipv4Addr::new(10, 0, 0, 1));
                 assert_eq!(requester_mac, Mac([2, 0, 0, 0, 0, 1]));
             }
-            other => panic!("unexpected event: {other:?}"),
+            _ => panic!("expected an ArpRequest copy event"),
+        }
+    }
+
+    /// The pre-existing kinds must keep decoding byte-identically — the watchdog event
+    /// shares the ringbuf, so a parser regression here would break the datapath.
+    #[test]
+    fn learn_ring_events_still_parse() {
+        let v4 = [
+            2, 0, 0, 0, 0, 1, 0, 4, 10, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        match super::parse_ring_event(&v4) {
+            Some(super::KernelEvent::Copy(CopyEvent::Learn { ip, mac })) => {
+                assert_eq!(ip, "10.0.0.5".parse::<std::net::IpAddr>().unwrap());
+                assert_eq!(mac, Mac([2, 0, 0, 0, 0, 1]));
+            }
+            _ => panic!("expected a v4 Learn"),
+        }
+        let mut v6 = [0u8; 24];
+        v6[0..6].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
+        v6[6] = 0;
+        v6[7] = 6;
+        v6[8] = 0xfe;
+        v6[9] = 0x80;
+        v6[23] = 1;
+        match super::parse_ring_event(&v6) {
+            Some(super::KernelEvent::Copy(CopyEvent::Learn { ip, .. })) => {
+                assert_eq!(ip, "fe80::1".parse::<std::net::IpAddr>().unwrap());
+            }
+            _ => panic!("expected a v6 Learn"),
+        }
+    }
+
+    #[test]
+    fn apf_external_write_ring_event() {
+        let mut d = [0u8; 24];
+        d[6] = 2; // kind = ApfExternalWrite
+        d[8..12].copy_from_slice(&4242u32.to_ne_bytes());
+        match super::parse_ring_event(&d) {
+            Some(super::KernelEvent::Apf(ev)) => assert_eq!(ev.tgid, 4242),
+            _ => panic!("expected an ApfExternalWrite"),
+        }
+    }
+
+    #[test]
+    fn bad_ring_events_are_rejected() {
+        assert!(super::parse_ring_event(&[0u8; 23]).is_none(), "short event");
+        let mut unknown = [1u8; 24];
+        unknown[6] = 9; // unknown kind
+        unknown[7] = 4;
+        assert!(super::parse_ring_event(&unknown).is_none(), "unknown kind");
+        let mut bad_fam = [1u8; 24];
+        bad_fam[6] = 0;
+        bad_fam[7] = 5; // neither 4 nor 6
+        assert!(
+            super::parse_ring_event(&bad_fam).is_none(),
+            "unknown family"
+        );
+    }
+
+    /// The source name strings are ELF section/symbol names. Together with `bpf_obj_parses`
+    /// below this catches an accidental omission of either the watchdog kprobe or the
+    /// existing tc programs without requiring CAP_BPF in unit tests.
+    #[test]
+    fn bpf_obj_has_apf_kprobe_section() {
+        let obj = super::bpf_obj();
+        assert!(
+            obj.windows(super::APF_KPROBE_PROG.len())
+                .any(|w| w == super::APF_KPROBE_PROG.as_bytes()),
+            "kprobe program symbol missing"
+        );
+        assert!(
+            obj.windows(b"apf_wd".len()).any(|w| w == b"apf_wd"),
+            "apf_wd map missing"
+        );
+        assert!(
+            obj.windows(b"kprobe/wlan_hdd_cfg80211_apf_offload".len())
+                .any(|w| w == b"kprobe/wlan_hdd_cfg80211_apf_offload"),
+            "kprobe section missing"
+        );
+        for p in [
+            b"classifier/fwd_out".as_slice(),
+            b"classifier/fwd_in",
+            b"classifier/direct_out",
+            b"classifier/direct_in",
+            b"classifier/egress_guard",
+        ] {
+            assert!(
+                obj.windows(p.len()).any(|w| w == p),
+                "tc section {:?} missing",
+                p
+            );
         }
     }
 

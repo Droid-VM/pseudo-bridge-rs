@@ -84,9 +84,9 @@ impl Net {
                             });
                             Some(NlChange::Link { index: l.header.index, name })
                         }
-                        Rnm::NewAddress(a) | Rnm::DelAddress(a) => {
-                            Some(NlChange::Addr { index: a.header.index })
-                        }
+                        Rnm::NewAddress(a) | Rnm::DelAddress(a) => Some(NlChange::Addr {
+                            index: a.header.index,
+                        }),
                         _ => None,
                     };
                     if let Some(c) = change {

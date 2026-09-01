@@ -86,6 +86,8 @@ re-initializes when it comes back.
 | `--offload-workaround` | off | install learned guest addrs on up0 (`v4,v6,v6ll` subset) so an aggressive firmware filter (Android **APF**) answers ARP/NS for them; fwd-only |
 | `--offload-workaround-magic` | 4243672773 | `IFA_RT_PRIORITY` tag marking those proxy addresses as ours |
 | `--arp-keepalive` | 0 (off) | seconds; push-refresh upstream v4 neighbour caches (see below). Recommended on Android Wi-Fi: 10 |
+| `--apf-watchdog-guest <IPv4>` | off (repeatable; max 8) | **ebpf only**: explicit guest IPv4s whose inbound ICMP echo request gets re-patched to PASS after NetworkStack overwrites Qualcomm APF. IPv6, duplicates, a ninth address, and `-e nft` are rejected. |
+| `--apf-watchdog-debounce-ms` | 200 | coalesce one NetworkStack APF update's several vendor calls before one read/patch/write/readback transaction |
 | `--vmroute-table` / `--vmroute-rule` | 200 / 11000 | table + `iif lo` rule priority for host→VM `/32`·`/128` routes (fwd); `-1` disables |
 | `--loglevel` | info | env_logger filter (`RUST_LOG` overrides) |
 
@@ -117,6 +119,60 @@ Entries are removed only while the recorded MAC still matches, so pbridge does n
 a user replacement.
 Requests with `spa=0.0.0.0` (ACD probes) are ignored. If APF/firmware drops the request
 before `up0`, software cannot observe it; keep `--arp-keepalive 10` for that case.
+
+### Optional APF ICMP watchdog (Qualcomm / Xiaomi Android)
+
+This is **not** the ARP/NS issue above. On the verified Xiaomi Qualcomm build, a vendor APF
+branch unconditionally drops every inbound IPv4 ICMP echo request (`DROPPED_ICMP_ECHO`,
+counter 21): Linux → guest ping fails, but TCP/UDP reaches the guest normally, and pinging
+the phone's own address fails too. pbridge can patch that one branch narrowly:
+
+```sh
+pbridge -i wlan0 -e ebpf -m fwd-with-offload \
+  --apf-watchdog-guest 192.168.1.204 \
+  --apf-watchdog-guest 192.168.1.205
+```
+
+This is an explicit opt-in, fixed list of **at most eight IPv4 addresses**. It deliberately
+does not follow the dynamic learn/aging table: allowing ICMP to a guest expands the input
+surface, so the operator must name each address. `-e nft`, IPv6, duplicate values, and a
+ninth address fail at startup; there is no polling fallback.
+
+With one or more addresses configured, the eBPF backend attaches a kprobe to Qualcomm's one
+APF vendor-command entry point, `wlan_hdd_cfg80211_apf_offload`. It records all calls except
+those from pbridge's own TGID. NetworkStack currently triggers this entry through **legacy
+SET** (device measurement: it did *not* call `wmi_send_apf_write_work_memory_cmd_tlv`), while
+pbridge uses APF 3.0 work-memory READ/WRITE because that is the channel whose final firmware
+bytes can be read back. The probe deliberately does not identify subcommands: any external
+APF touch is debounced (default 200 ms) into one safe recheck.
+
+The recheck is a fail-closed transaction:
+
+```text
+disable → read 2048-byte APF work memory → derive actual program length
+        → locate the verified vendor ICMP-drop pattern → patch + structurally validate
+        → write → read same length → byte-for-byte compare → enable
+```
+
+The patch inserts `ldw r0,[30]` plus one `jeq r0,<guest>,PASS` per address (2 + 9×N bytes),
+repairs every forward jump crossing the insertion point, and reduces the APF debug buffer by
+the same amount. It refuses unfamiliar/ambiguous programs, insufficient debugbuf, immediate
+overflow, or a readback mismatch — and always attempts `enable` after a successful `disable`.
+A failed transaction leaves the firmware's existing program enabled and retries with bounded
+backoff only after an overwrite event. Events that arrive while the transaction runs are
+coalesced into one additional recheck; pbridge's own disable/read/write/enable sequence is
+filtered in BPF, preventing a self-trigger loop.
+
+This requires a kernel that permits BPF kprobes and exposes that exact Qualcomm driver symbol.
+If the map/program load or attach fails, startup fails rather than reporting a watchdog that is
+not actually detecting overwrites. A watchdog guest also gets active **cold-start discovery**:
+once the hooks and guest-facing bridge are ready, pbridge sends an anonymous ARP ACD probe
+(`spa=0.0.0.0`) for each configured-but-unlearned IPv4. A real guest defense/reply traverses
+the normal OUT path and supplies its real MAC binding; pbridge never invents one. It retries
+once per second for five seconds after session init, then every 30 seconds only while the
+explicit guest remains unlearned. It is deliberately device-specific, and does not replace
+normal APF / powersave validation. See [`../apf/APF_WATCHDOG_DESIGN.md`](../apf/APF_WATCHDOG_DESIGN.md)
+for the original measured rationale and device-level acceptance checks.
 
 Before aging, pbridge actively probes every installed guest: an anonymous ARP probe for
 IPv4 and a DAD-style Neighbor Solicitation for IPv6. In `fwd` mode the probe enters the

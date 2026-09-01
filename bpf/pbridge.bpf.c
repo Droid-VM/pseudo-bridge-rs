@@ -14,6 +14,7 @@ static long (*bpf_clone_redirect)(struct __sk_buff *, __u32, __u64) = (void *)13
 static long (*bpf_redirect)(__u32, __u64) = (void *)23;
 static long (*bpf_skb_load_bytes)(const void *, __u32, void *, __u32) = (void *)26;
 static __s64 (*bpf_csum_diff)(__be32 *, __u32, __be32 *, __u32, __wsum) = (void *)28;
+static __u64 (*bpf_get_current_pid_tgid)(void) = (void *)14;
 static long (*bpf_ringbuf_output)(void *, void *, __u64, __u64) = (void *)130;
 
 #define __uint(name, val) int (*name)[val]
@@ -31,6 +32,15 @@ struct in6 { __u8 a[16]; };
 struct mac { __u8 a[6]; };
 struct copy_evt { __u8 mac[6]; __u8 kind; __u8 fam; __u8 ip[16]; };
 
+/* APF watchdog config. Deliberately NOT part of `config`: that map's layout is a
+ * fixed ABI shared with the Rust `Cfg` struct, and the datapath reads it per packet.
+ * enabled=0 makes the kprobe a single map lookup + return.
+ */
+struct wdcfg {
+    __u32 enabled;
+    __u32 self_tgid; /* pbridge's own TGID: its APF transactions must not self-trigger */
+};
+
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
     __type(key, __u32); __type(value, struct cfg); } config __attribute__((section(".maps"), used));
 struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 256);
@@ -47,6 +57,8 @@ struct { __uint(type, BPF_MAP_TYPE_HASH); __uint(max_entries, 8192);
     __type(key, struct in6); __type(value, __u8); } seen6 __attribute__((section(".maps"), used));
 struct { __uint(type, BPF_MAP_TYPE_RINGBUF); __uint(max_entries, 1 << 18); }
     events __attribute__((section(".maps"), used));
+struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 1);
+    __type(key, __u32); __type(value, struct wdcfg); } apf_wd __attribute__((section(".maps"), used));
 
 #define hs(x) __builtin_bswap16(x)
 #define PACKET_BROADCAST 1
@@ -437,6 +449,36 @@ int egress_guard(struct __sk_buff *skb) {
         }
     }
     return TC_ACT_OK;
+}
+
+// APF watchdog notification. wlan_hdd_cfg80211_apf_offload() is the driver's ONLY
+// entry point for QCA_NL80211_VENDOR_SUBCMD_PACKET_FILTER, so this one probe covers
+// every sub-command: legacy SET (what NetworkStack currently uses), APF 3.0
+// WRITE/READ, and enable/disable. We deliberately do NOT inspect the sub-command:
+// the arguments are a cfg80211 wiphy/wdev + an unparsed nlattr blob, and reading them
+// would buy nothing — userspace debounces anyway and any external touch of the APF
+// path is a reason to re-verify the program.
+//
+// Self-filter by TGID: pbridge's own transaction is four vendor commands
+// (disable/read/write/enable). Without the filter each of them would re-arm the
+// watchdog and the process would spin forever repatching its own work.
+//
+// Only bpf_get_current_pid_tgid() is used — no argument reads, no kallsyms lookups,
+// no CO-RE relocations — so this is safe on Android GKI where module symbol addresses
+// read as 0 and KASLR is on. If the symbol does not exist, attach() fails at init and
+// pbridge exits rather than pretending the watchdog is armed.
+__attribute__((section("kprobe/wlan_hdd_cfg80211_apf_offload"), used))
+int apf_offload_probe(void *ctx) {
+    __u32 k = 0;
+    struct wdcfg *w = bpf_map_lookup_elem(&apf_wd, &k);
+    if (!w || !w->enabled) return 0;
+    __u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    if (tgid == w->self_tgid) return 0;
+    struct copy_evt ev = {};
+    ev.kind = 2; /* EVT_APF_EXTERNAL_WRITE */
+    __builtin_memcpy(ev.ip, &tgid, 4);
+    bpf_ringbuf_output(&events, &ev, sizeof(ev), 0);
+    return 0;
 }
 
 char _license[] __attribute__((section("license"), used)) = "GPL";

@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 use clap::{Parser, ValueEnum};
+use std::net::Ipv4Addr;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Engine {
@@ -225,6 +226,61 @@ pub struct Cli {
     /// a table that's already consulted, like `local`); a number is the priority. Default `11000`.
     #[arg(long = "vmroute-rule", default_value = "11000")]
     pub vmroute_rule: RouteTarget,
+
+    /// APF watchdog (Android/Qualcomm, `-e ebpf` only; repeatable, max 8 IPv4): keep an
+    /// "ICMP echo request to this guest → PASS" rule alive in the Wi-Fi firmware's APF
+    /// program. The Xiaomi vendor APF drops ALL inbound IPv4 ICMP echo requests
+    /// (`DROPPED_ICMP_ECHO`), and NetworkStack regenerates the program on Doze / RA /
+    /// address / multicast / keepalive changes, so a hand-installed patch is short-lived.
+    /// With this flag pbridge kprobes the driver's single APF vendor-command entry point,
+    /// and after every *external* install (its own writes are filtered by TGID in-kernel)
+    /// re-reads the firmware's APF work memory, re-inserts the pass rules for these
+    /// addresses, writes it back and verifies it byte-for-byte.
+    ///
+    /// Fixed list on purpose: it widens the host's inbound ICMP surface, so the operator
+    /// names the addresses instead of pbridge deriving them from the (aging, churning)
+    /// learn table. Empty = feature off.
+    #[arg(long = "apf-watchdog-guest", value_name = "IPV4")]
+    pub apf_watchdog_guest: Vec<Ipv4Addr>,
+
+    /// Debounce window (ms) for coalescing one NetworkStack APF update's several vendor
+    /// commands into a single repatch transaction.
+    #[arg(long = "apf-watchdog-debounce-ms", default_value_t = 200)]
+    pub apf_watchdog_debounce_ms: u64,
+}
+
+/// Max `--apf-watchdog-guest` addresses. Each costs 9 program bytes (a `jeq r0,<ip>,PASS`)
+/// plus 2 for the shared `ldw r0,[30]`; the patcher also refuses to exceed the debugbuf.
+pub const APF_WATCHDOG_MAX_GUESTS: usize = 8;
+
+/// Validate the parsed CLI beyond what clap can express per-arg. Returns the deduplicated,
+/// sorted APF watchdog guest list (empty = feature off).
+pub fn validate_apf_watchdog(cli: &Cli) -> Result<Vec<Ipv4Addr>, String> {
+    if cli.apf_watchdog_guest.is_empty() {
+        return Ok(Vec::new());
+    }
+    if cli.engine != Engine::Ebpf {
+        return Err(
+            "--apf-watchdog-guest needs -e ebpf: overwrite detection is a BPF kprobe on the \
+             driver's APF vendor command, and there is no polling fallback"
+                .into(),
+        );
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for ip in &cli.apf_watchdog_guest {
+        if !seen.insert(*ip) {
+            return Err(format!("--apf-watchdog-guest {ip}: duplicate address"));
+        }
+    }
+    if seen.len() > APF_WATCHDOG_MAX_GUESTS {
+        return Err(format!(
+            "--apf-watchdog-guest: {} addresses given, at most {APF_WATCHDOG_MAX_GUESTS} supported",
+            seen.len()
+        ));
+    }
+    // Sorted: the patcher emits one jeq per address in this order, so the generated
+    // program (and therefore the readback compare) is independent of CLI argument order.
+    Ok(seen.into_iter().collect())
 }
 
 /// Parse a u32 magic value as decimal or 0x-prefixed hex.
@@ -288,9 +344,105 @@ mod tests {
             arp_keepalive: 0,
             vmroute_table: RouteTarget(Some(200)),
             vmroute_rule: RouteTarget(Some(11000)),
+            apf_watchdog_guest: vec![],
+            apf_watchdog_debounce_ms: 200,
         };
         assert_eq!(cli.fwd0(), "wlan0verylon-if");
         assert_eq!(cli.fwd1(), "wlan0verylon-br");
+    }
+
+    fn parse_args(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec![
+            "pbridge",
+            "-i",
+            "wlan0",
+            "-e",
+            "ebpf",
+            "-m",
+            "fwd-with-offload",
+        ];
+        argv.extend_from_slice(extra);
+        Cli::try_parse_from(argv)
+    }
+
+    #[test]
+    fn apf_watchdog_off_by_default() {
+        let cli = parse_args(&[]).unwrap();
+        assert!(cli.apf_watchdog_guest.is_empty());
+        assert_eq!(validate_apf_watchdog(&cli), Ok(vec![]));
+    }
+
+    #[test]
+    fn apf_watchdog_rejects_ipv6() {
+        assert!(parse_args(&["--apf-watchdog-guest", "fe80::1"]).is_err());
+        assert!(parse_args(&["--apf-watchdog-guest", "not-an-ip"]).is_err());
+    }
+
+    #[test]
+    fn apf_watchdog_sorts_and_rejects_duplicates() {
+        let cli = parse_args(&[
+            "--apf-watchdog-guest",
+            "192.168.1.204",
+            "--apf-watchdog-guest",
+            "192.168.1.7",
+        ])
+        .unwrap();
+        assert_eq!(
+            validate_apf_watchdog(&cli),
+            Ok(vec![
+                Ipv4Addr::new(192, 168, 1, 7),
+                Ipv4Addr::new(192, 168, 1, 204)
+            ])
+        );
+
+        let dup = parse_args(&[
+            "--apf-watchdog-guest",
+            "192.168.1.204",
+            "--apf-watchdog-guest",
+            "192.168.1.204",
+        ])
+        .unwrap();
+        assert!(validate_apf_watchdog(&dup).is_err());
+    }
+
+    #[test]
+    fn apf_watchdog_guest_cap() {
+        let mut eight = Vec::new();
+        for n in 1..=8u8 {
+            eight.push("--apf-watchdog-guest".to_string());
+            eight.push(format!("10.0.0.{n}"));
+        }
+        let refs: Vec<&str> = eight.iter().map(|s| s.as_str()).collect();
+        let cli = parse_args(&refs).unwrap();
+        assert_eq!(validate_apf_watchdog(&cli).map(|v| v.len()), Ok(8));
+
+        let mut nine = eight.clone();
+        nine.push("--apf-watchdog-guest".into());
+        nine.push("10.0.0.9".into());
+        let refs: Vec<&str> = nine.iter().map(|s| s.as_str()).collect();
+        let cli = parse_args(&refs).unwrap();
+        assert!(
+            validate_apf_watchdog(&cli).is_err(),
+            "9th address must be rejected"
+        );
+    }
+
+    #[test]
+    fn apf_watchdog_requires_ebpf() {
+        let cli = Cli::try_parse_from([
+            "pbridge",
+            "-i",
+            "wlan0",
+            "-e",
+            "nft",
+            "-m",
+            "fwd",
+            "--apf-watchdog-guest",
+            "192.168.1.204",
+        ])
+        .unwrap();
+        let err = validate_apf_watchdog(&cli).unwrap_err();
+        assert!(err.contains("-e ebpf"), "{err}");
     }
 
     #[test]

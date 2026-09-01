@@ -4,8 +4,13 @@
 //! netlink link/addr changes (recompute+diff), and the aging timer.
 #![forbid(unsafe_code)] // core algorithm: memory-safety is compiler-guaranteed here
 
-use crate::afpacket::{build_arp_probe, build_arp_reply, build_arp_request, build_ns_dad, Injector};
-use crate::backend::{Backend, CopyEvent, InitCfg, COPY_QUEUE_DEPTH};
+use crate::afpacket::{
+    build_arp_probe, build_arp_reply, build_arp_request, build_ns_dad, Injector,
+};
+use crate::apf::{self, VendorSocket};
+use crate::backend::{
+    ApfExternalWrite, Backend, CopyEvent, InitCfg, APF_QUEUE_DEPTH, COPY_QUEUE_DEPTH,
+};
 use crate::cli::{Cli, Engine, Mode};
 use crate::netlink::{AddrInfo, Net};
 use crate::packet::{build_frame, classify_learn, fix_icmpv6_csum, ETHERTYPE_IPV6};
@@ -56,6 +61,7 @@ pub struct Core {
     initialized: bool,
     injector: Option<Injector>,
     copy_tx: Sender<CopyEvent>,
+    apf_tx: Option<Sender<ApfExternalWrite>>,
     host_routes: HashSet<IpAddr>, // fwd: ips with a /32-/128 host route programmed
     mirrored_br: Option<u32>,     // fwd: bridge index we last mirrored up0's IPs onto
     saved_br_cfg: Option<SavedBrCfg>, // fwd: bridge IPv6 knobs to restore on detach
@@ -67,7 +73,34 @@ pub struct Core {
     probe_injector: Option<Injector>, // guest-facing AF_PACKET device for aging probes
     aging_tick: u64,                 // counts aging ticks (probe/flush alternation)
     skip_flush_once: bool,            // probe send failure: preserve entries for one tick
-    keepalive_tick: u64,             // counts --arp-keepalive ticks (GARP every Nth)
+    keepalive_tick: u64,              // counts --arp-keepalive ticks (GARP every Nth)
+    apf: Option<ApfWatchdog>,         // --apf-watchdog-guest state (ebpf only)
+    apf_discovery_ticks: u64, // cold-start ticks since an explicit APF guest was last unresolved
+}
+
+/// APF watchdog state. Present iff `--apf-watchdog-guest` was given; the vendor socket is
+/// opened lazily at session init (it needs the driver loaded) and dropped at teardown.
+struct ApfWatchdog {
+    guests: Vec<Ipv4Addr>,
+    sock: Option<VendorSocket>,
+    ifindex: u32,
+    /// Consecutive failures, for the retry backoff.
+    failures: u32,
+}
+
+/// Retry backoff after a failed transaction. A failure is usually "the firmware/driver is
+/// busy or the program is unfamiliar", so back off instead of hammering disable/enable.
+const APF_BACKOFF_SECS: [u64; 5] = [1, 2, 5, 10, 30];
+
+/// Explicit watchdog guests have no MAC at cold start, so they cannot be pre-filled into
+/// `ip2mac`. Ask them to defend their IPv4 address on the guest bridge instead. A short
+/// burst makes the first inbound packet work without waiting for natural guest traffic;
+/// then back off to avoid waking a missing VM forever.
+const APF_DISCOVERY_FAST_TICKS: u64 = 5;
+const APF_DISCOVERY_SLOW_EVERY: u64 = 30;
+
+fn apf_discovery_due(tick: u64) -> bool {
+    tick <= APF_DISCOVERY_FAST_TICKS || tick.is_multiple_of(APF_DISCOVERY_SLOW_EVERY)
 }
 
 /// --arp-keepalive sends the GARP broadcast only every Nth tick (unicast replies go
@@ -75,11 +108,18 @@ pub struct Core {
 const GARP_EVERY: u64 = 3;
 
 pub async fn run(cli: Cli) -> Result<()> {
+    // Reject an unsupported combination before touching the kernel.
+    let apf_guests = crate::cli::validate_apf_watchdog(&cli).map_err(|e| anyhow!(e))?;
+
     let net = Net::connect()?;
     let mut nl_rx = Net::monitor()?;
     // Bounded + lossy (see COPY_QUEUE_DEPTH): a learn flood degrades to dropped copies
     // (the next packet re-learns) instead of unbounded queue growth.
     let (copy_tx, mut copy_rx) = channel(COPY_QUEUE_DEPTH);
+    // Depth-1, coalescing, NOT lossy (see ApfExternalWrite). Only created when the
+    // watchdog is on, so the ebpf session is otherwise unchanged.
+    let (apf_tx_raw, mut apf_rx) = channel::<ApfExternalWrite>(APF_QUEUE_DEPTH);
+    let apf_tx = (!apf_guests.is_empty()).then_some(apf_tx_raw);
 
     let backend: Box<dyn Backend> = match cli.engine {
         Engine::Nft => Box::new(crate::backend::nft::NftBackend::new()),
@@ -97,6 +137,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         initialized: false,
         injector: None,
         copy_tx,
+        apf_tx: apf_tx.clone(),
         host_routes: HashSet::new(),
         mirrored_br: None,
         saved_br_cfg: None,
@@ -107,7 +148,22 @@ pub async fn run(cli: Cli) -> Result<()> {
         aging_tick: 0,
         skip_flush_once: false,
         keepalive_tick: 0,
+        apf: (!apf_guests.is_empty()).then(|| ApfWatchdog {
+            guests: apf_guests.clone(),
+            sock: None,
+            ifindex: 0,
+            failures: 0,
+        }),
+        apf_discovery_ticks: 0,
     };
+    if !apf_guests.is_empty() {
+        log::info!(
+            "apf-watchdog: enabled for {} guest(s) {:?}, debounce {}ms",
+            apf_guests.len(),
+            apf_guests,
+            core.cli.apf_watchdog_debounce_ms
+        );
+    }
     if core.cli.offload_workaround.is_some() && !core.is_fwd() {
         log::warn!("--offload-workaround is set but mode is direct; ignoring (fwd-mode only)");
     }
@@ -140,7 +196,31 @@ pub async fn run(cli: Cli) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
+    // APF watchdog timer: a single armed deadline that serves both roles. A kprobe event
+    // sets it to now+debounce, coalescing the several vendor commands NetworkStack issues
+    // for one logical update; a failed transaction sets it to now+backoff. Events arriving
+    // during a transaction are still queued (the depth-1 channel holds one), so the next
+    // loop iteration re-arms and runs again — that is the "repatch once more if it was
+    // overwritten mid-transaction" requirement, without a second timer.
+    let apf_debounce = Duration::from_millis(core.cli.apf_watchdog_debounce_ms);
+    let apf_enabled = core.apf.is_some();
+    let mut apf_deadline: Option<tokio::time::Instant> = None;
+
+    // Cold-start discovery for explicitly configured APF guests. This is separate from
+    // the normal aging interval: a default 30 s aging tick would leave a restart's first
+    // inbound packet black-holed for far too long. The tick only emits anonymous ARP
+    // probes for configured-but-unlearned IPv4s; it never scans or trusts an address.
+    let mut apf_discovery = tokio::time::interval(Duration::from_secs(1));
+    apf_discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    apf_discovery.tick().await; // consume interval's immediate first tick
+
     loop {
+        // A disarmed timer must never fire; park it far out and gate the arm on the flag.
+        let apf_sleep = tokio::time::sleep_until(
+            apf_deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600)),
+        );
+        tokio::pin!(apf_sleep);
+
         tokio::select! {
             Some(ev) = copy_rx.recv() => {
                 if let Err(e) = core.on_copy(ev).await { log::warn!("copy: {e:#}"); }
@@ -179,6 +259,34 @@ pub async fn run(cli: Cli) -> Result<()> {
             _ = keepalive.tick(), if ka_enabled => {
                 if let Err(e) = core.on_arp_keepalive().await { log::warn!("arp-keepalive: {e:#}"); }
             }
+            _ = apf_discovery.tick(), if apf_enabled => {
+                if let Err(e) = core.on_apf_discovery_tick() {
+                    log::warn!("apf-watchdog discovery: {e:#}");
+                }
+            }
+            ev = apf_rx.recv(), if apf_enabled => {
+                match ev {
+                    Some(ev) => {
+                        log::debug!(
+                            "apf-watchdog: external APF vendor command from tgid {} — repatch in {}ms",
+                            ev.tgid, apf_debounce.as_millis()
+                        );
+                        apf_deadline = Some(tokio::time::Instant::now() + apf_debounce);
+                    }
+                    None => {
+                        // The ringbuf reader is gone (backend torn down): nothing can
+                        // notify us any more, so cancel any pending retry.
+                        apf_deadline = None;
+                    }
+                }
+            }
+            _ = &mut apf_sleep, if apf_enabled && apf_deadline.is_some() => {
+                // Disarm first: the transaction is inline, and on success nothing re-arms.
+                // A failure returns its backoff; an event that arrived meanwhile is still
+                // in the depth-1 channel and re-arms on the next iteration.
+                apf_deadline = core.apf_repatch("external APF write").await
+                    .map(|backoff| tokio::time::Instant::now() + backoff);
+            }
             _ = sigterm.recv() => { log::info!("SIGTERM"); break; }
             _ = sigint.recv() => { log::info!("SIGINT"); break; }
         }
@@ -202,9 +310,11 @@ impl Core {
             return None;
         }
         self.cli.offload_workaround.or(match self.cli.mode {
-            Mode::FwdOffload => {
-                Some(crate::cli::OffloadFamilies { v4: true, v6: true, v6ll: false })
-            }
+            Mode::FwdOffload => Some(crate::cli::OffloadFamilies {
+                v4: true,
+                v6: true,
+                v6ll: false,
+            }),
             _ => None,
         })
     }
@@ -394,7 +504,9 @@ impl Core {
     /// the operator can detach / re-attach / swap bridges afterwards and pbridge
     /// follows via netlink as usual. Best-effort: a missing bridge (or dev) only warns.
     async fn ensure_bridge(&self, dev: &str) {
-        let Some(br_name) = &self.cli.bridge else { return };
+        let Some(br_name) = &self.cli.bridge else {
+            return;
+        };
         let br = match self.net.get_link_by_name(br_name).await {
             Ok(Some(b)) => b,
             _ => {
@@ -402,7 +514,9 @@ impl Core {
                 return;
             }
         };
-        let Ok(Some(d)) = self.net.get_link_by_name(dev).await else { return };
+        let Ok(Some(d)) = self.net.get_link_by_name(dev).await else {
+            return;
+        };
         if d.master == Some(br.index) {
             return; // already there
         }
@@ -467,6 +581,7 @@ impl Core {
             hostmac,
             brmac: snap.brmac,
             host_ips: snap.host_ips.iter().map(|a| a.ip).collect(),
+            apf_watchdog: self.apf.is_some(),
         };
 
         self.injector = Some(Injector::new(snap.up0_index)?);
@@ -474,9 +589,15 @@ impl Core {
         // bridge in fwd mode; the bridge master is the correct ingress in direct mode.
         let probe_ifindex = if self.is_fwd() { fwd0_index } else { snap.br_index };
         self.probe_injector = probe_ifindex.map(Injector::new).transpose()?;
-        self.backend.init(&cfg, self.copy_tx.clone())?;
+        self.backend
+            .init(&cfg, self.copy_tx.clone(), self.apf_tx.clone())?;
         self.initialized = true;
         self.snap = snap;
+
+        // APF watchdog: only now, with the backend loaded (so the kprobe is armed and its
+        // events can reach us) and up0's ifindex known. The first repatch runs immediately
+        // — the live program is whatever NetworkStack installed before we started.
+        self.apf_session_start().await;
 
         // --bridge: enslave the guest-facing port only now, AFTER the hooks are live —
         // otherwise (direct especially) there's a window where the kernel bridge floods
@@ -493,6 +614,13 @@ impl Core {
         }
 
         self.reconcile_all().await?;
+        // The normal aging probe only iterates `installed`, which is intentionally empty
+        // after a stateless restart. Explicit APF guests need one discovery ARP now that
+        // hooks and (in fwd mode) the guest-facing bridge path are all live.
+        self.apf_discovery_ticks = 0;
+        if let Err(e) = self.probe_apf_watchdog_guests() {
+            log::warn!("apf-watchdog initial guest discovery: {e:#}");
+        }
         log::info!("{} backend running", self.backend.name());
         Ok(())
     }
@@ -501,7 +629,14 @@ impl Core {
         if !self.initialized {
             return Ok(());
         }
-        log::info!("teardown session ({} vmroutes dropped)", self.installed.len());
+        log::info!(
+            "teardown session ({} vmroutes dropped)",
+            self.installed.len()
+        );
+        // Stop the watchdog BEFORE dropping the backend: disarming the kprobe first means
+        // the teardown's own vendor traffic (and anyone else's) can't queue one last
+        // repatch against an interface that is going away.
+        self.apf_session_stop();
         // withdraw host routes + unmirror the bridge we put up0's IPs on
         self.withdraw_all_host_routes().await;
         self.remove_vmroute_rules().await;
@@ -520,7 +655,138 @@ impl Core {
         self.injector = None;
         self.probe_injector = None;
         self.skip_flush_once = false;
+        self.apf_discovery_ticks = 0;
         self.initialized = false;
+        Ok(())
+    }
+
+    // ---- APF watchdog ----
+
+    /// Session init: open the vendor socket, pin up0's ifindex, and do the first repatch.
+    /// A failure is logged, not fatal — the next external APF write retries. (Arming the
+    /// kprobe already failed hard in `backend.init` if the driver has no APF path at all.)
+    async fn apf_session_start(&mut self) {
+        let Some(wd) = &mut self.apf else { return };
+        wd.ifindex = self.snap.up0_index;
+        wd.failures = 0;
+        match VendorSocket::open() {
+            Ok(s) => wd.sock = Some(s),
+            Err(e) => {
+                log::error!("apf-watchdog: cannot open the nl80211 vendor socket: {e:#}");
+                return;
+            }
+        }
+        log::info!("apf-watchdog: session up on ifindex {}", wd.ifindex);
+        self.apf_repatch("session init").await;
+    }
+
+    /// Session teardown: drop the socket so no repatch can run against a dead interface.
+    /// The kprobe itself goes away with the `Ebpf` object when the backend is dropped.
+    fn apf_session_stop(&mut self) {
+        if let Some(wd) = &mut self.apf {
+            if wd.sock.take().is_some() {
+                log::info!("apf-watchdog: session down");
+            }
+            wd.ifindex = 0;
+            wd.failures = 0;
+        }
+    }
+
+    /// Run one repatch transaction. Returns the backoff to wait before retrying, or None
+    /// when there is nothing to retry.
+    async fn apf_repatch(&mut self, reason: &str) -> Option<Duration> {
+        if !self.initialized {
+            return None;
+        }
+        let Some(wd) = &mut self.apf else { return None };
+        let (Some(sock), ifindex) = (wd.sock.as_mut(), wd.ifindex) else {
+            return None;
+        };
+        if ifindex == 0 {
+            return None;
+        }
+        let guests = wd.guests.clone();
+        // Blocking, but bounded: the four vendor commands measured ~42 ms total on device,
+        // and the socket has a 2s recv timeout. Running it inline keeps the core actor the
+        // single writer — no lock, no concurrent transaction, no half-applied program.
+        let result = apf::repatch(sock, ifindex, &guests);
+        match result {
+            Ok(apf::Outcome::Patched {
+                stock_len,
+                patched_len,
+                guests,
+            }) => {
+                wd.failures = 0;
+                log::info!(
+                    "apf-watchdog: repatched after {reason}: {stock_len} -> {patched_len} bytes, \
+                     {guests} guest(s) passed, readback verified"
+                );
+                None
+            }
+            Ok(apf::Outcome::AlreadyPatched { len }) => {
+                wd.failures = 0;
+                log::debug!(
+                    "apf-watchdog: {reason}: live {len}-byte program already carries our rules"
+                );
+                None
+            }
+            Err(e) => {
+                wd.failures = wd.failures.saturating_add(1);
+                let idx = (wd.failures as usize - 1).min(APF_BACKOFF_SECS.len() - 1);
+                let backoff = Duration::from_secs(APF_BACKOFF_SECS[idx]);
+                log::warn!(
+                    "apf-watchdog: repatch after {reason} failed (attempt {}): {e:#}; APF left \
+                     enabled with the firmware's own program, retrying in {}s",
+                    wd.failures,
+                    backoff.as_secs()
+                );
+                Some(backoff)
+            }
+        }
+    }
+
+    /// Cold-start discovery for explicit `--apf-watchdog-guest` IPv4s. It uses the same
+    /// anonymous RFC 5227 ARP probe as aging (`spa=0.0.0.0`, L2 broadcast): this asks a
+    /// live guest to defend its address, and the guest's real ARP reply passes through the
+    /// normal OUT hook to establish the authoritative `(IP, MAC)` binding. We never insert
+    /// a static/guessed MAC into `ip2mac`, and we never scan addresses the operator did not
+    /// explicitly name.
+    fn probe_apf_watchdog_guests(&self) -> Result<usize> {
+        if !self.initialized {
+            return Ok(0);
+        }
+        let Some(wd) = &self.apf else { return Ok(0) };
+        let Some(inj) = &self.probe_injector else {
+            return Ok(0);
+        };
+        let Some(hostmac) = self.snap.hostmac else {
+            return Ok(0);
+        };
+        let mut sent = 0;
+        for guest in &wd.guests {
+            if self.entries.get(&IpAddr::V4(*guest)).is_some() {
+                continue;
+            }
+            inj.send_frame(&build_arp_probe(*guest, hostmac))?;
+            sent += 1;
+        }
+        if sent != 0 {
+            log::debug!("apf-watchdog: sent {sent} cold-start ARP discovery probe(s)");
+        }
+        Ok(sent)
+    }
+
+    /// First five seconds after a restart probe once per second. Thereafter keep a small
+    /// 30-second heartbeat for an explicit guest that was offline at session start. A
+    /// learned entry exits this path immediately and uses the ordinary aging probe instead.
+    fn on_apf_discovery_tick(&mut self) -> Result<()> {
+        if !self.initialized || self.apf.is_none() {
+            return Ok(());
+        }
+        self.apf_discovery_ticks = self.apf_discovery_ticks.wrapping_add(1);
+        if apf_discovery_due(self.apf_discovery_ticks) {
+            self.probe_apf_watchdog_guests()?;
+        }
         Ok(())
     }
 
@@ -902,7 +1168,9 @@ impl Core {
         }
         self.keepalive_tick = self.keepalive_tick.wrapping_add(1);
         let garp_tick = self.keepalive_tick.is_multiple_of(GARP_EVERY);
-        let Some(hostmac) = self.snap.hostmac else { return Ok(()) };
+        let Some(hostmac) = self.snap.hostmac else {
+            return Ok(());
+        };
 
         // Neighbours resolving to HOSTMAC (host's own addrs, MAC-NAT'd guests) are "us",
         // not peers — neighbours_v4 filters them out during the scan.
@@ -925,7 +1193,9 @@ impl Core {
             })
             .collect();
 
-        let Some(inj) = &self.injector else { return Ok(()) };
+        let Some(inj) = &self.injector else {
+            return Ok(());
+        };
         for gw in missing_gws {
             if let Some(src) = host_v4s.first() {
                 let _ = inj.send_frame(&build_arp_request(gw, *src, hostmac));
@@ -979,8 +1249,12 @@ impl Core {
     /// align as flush → (skipped probe) → flush and age out a silent-but-present
     /// guest.
     fn probe(&mut self) -> Result<()> {
-        let Some(inj) = &self.probe_injector else { return Ok(()) };
-        let Some(hostmac) = self.snap.hostmac else { return Ok(()) };
+        let Some(inj) = &self.probe_injector else {
+            return Ok(());
+        };
+        let Some(hostmac) = self.snap.hostmac else {
+            return Ok(());
+        };
         if self.installed.is_empty() {
             return Ok(());
         }
@@ -1043,8 +1317,12 @@ impl Core {
             return Ok(());
         }
         // vmroute table disabled (-1) → don't write any host route.
-        let Some(table) = self.cli.vmroute_table.0 else { return Ok(()) };
-        let Some(br_index) = self.snap.br_index else { return Ok(()) };
+        let Some(table) = self.cli.vmroute_table.0 else {
+            return Ok(());
+        };
+        let Some(br_index) = self.snap.br_index else {
+            return Ok(());
+        };
         // link-local: ip2mac only (for ND demux), no /32-/128 route (scope link, not
         // routable). Applies to both the v6 fe80 and v4 169.254 cases.
         if is_link_local(&ip) {
@@ -1121,7 +1399,9 @@ impl Core {
     /// up0 ones. That way the VM (bridge segment) and external neighbours (upstream) see
     /// the *same* host IP. Originals are saved for restore on detach.
     async fn apply_bridge_cfg(&mut self, br_index: u32) {
-        let Some(name) = self.br_name(br_index).await else { return };
+        let Some(name) = self.br_name(br_index).await else {
+            return;
+        };
         let agm = read_ipv6_conf(&name, "addr_gen_mode").unwrap_or_else(|| "0".into());
         let ara = read_ipv6_conf(&name, "accept_ra").unwrap_or_else(|| "1".into());
         write_ipv6_conf(&name, "addr_gen_mode", "1"); // none — no auto link-local
@@ -1150,7 +1430,9 @@ impl Core {
 
     /// On bridge detach/change/teardown: restore the bridge's original IPv6 knobs.
     async fn restore_bridge_cfg(&mut self, br_index: u32) {
-        let Some(cfg) = self.saved_br_cfg.take() else { return };
+        let Some(cfg) = self.saved_br_cfg.take() else {
+            return;
+        };
         if cfg.index != br_index {
             self.saved_br_cfg = Some(cfg);
             return;
@@ -1198,7 +1480,9 @@ impl Core {
             }
             self.mirrored_br = None;
         }
-        let Some(br_index) = target else { return Ok(()) };
+        let Some(br_index) = target else {
+            return Ok(());
+        };
         if self.mirrored_br.is_none() {
             // first mirror onto this bridge: make it mirror-only addressed.
             self.apply_bridge_cfg(br_index).await;
@@ -1298,7 +1582,24 @@ mod tests {
     use super::*;
 
     fn ai(ip: &str, plen: u8) -> AddrInfo {
-        AddrInfo { ip: ip.parse().unwrap(), plen, global: true, noprefixroute: false, rt_priority: 0 }
+        AddrInfo {
+            ip: ip.parse().unwrap(),
+            plen,
+            global: true,
+            noprefixroute: false,
+            rt_priority: 0,
+        }
+    }
+
+    #[test]
+    fn apf_discovery_schedule_is_bounded() {
+        for tick in 1..=APF_DISCOVERY_FAST_TICKS {
+            assert!(apf_discovery_due(tick), "fast tick {tick} must probe");
+        }
+        assert!(!apf_discovery_due(APF_DISCOVERY_FAST_TICKS + 1));
+        assert!(!apf_discovery_due(APF_DISCOVERY_SLOW_EVERY - 1));
+        assert!(apf_discovery_due(APF_DISCOVERY_SLOW_EVERY));
+        assert!(apf_discovery_due(APF_DISCOVERY_SLOW_EVERY * 2));
     }
 
     #[test]

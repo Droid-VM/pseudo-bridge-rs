@@ -346,7 +346,17 @@ impl Backend for NftBackend {
         "nft"
     }
 
-    fn init(&mut self, cfg: &InitCfg, copy_tx: Sender<CopyEvent>) -> Result<()> {
+    fn init(
+        &mut self,
+        cfg: &InitCfg,
+        copy_tx: Sender<CopyEvent>,
+        apf_tx: Option<Sender<crate::backend::ApfExternalWrite>>,
+    ) -> Result<()> {
+        // The watchdog needs a BPF kprobe; the CLI rejects nft + watchdog up front, so
+        // reaching here means the wiring is wrong rather than the configuration.
+        if cfg.apf_watchdog || apf_tx.is_some() {
+            anyhow::bail!("nft backend does not support the APF watchdog (needs -e ebpf)");
+        }
         self.cfg = Some(cfg.clone());
         self.hostmac = cfg.hostmac;
         self.brmac = cfg.brmac;

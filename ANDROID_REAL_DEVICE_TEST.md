@@ -196,6 +196,47 @@ ARP request，但不能替代 keepalive 解决 Wi-Fi APF/firmware 在 `wlan0` �
 完全静默的 guest 仍会在 `--timeout` 到期后被移除。guest 再发一个 ARP/IP 包可以
 重新学习并恢复，但恢复前的第一个 host/peer 包可能已经丢失。
 
+## Doze/APF 前置过滤的决定性对照
+
+为确认 host -> guest 的首包失败是否来自 APF，在同一台设备上执行了直接 adb 对照。
+测试前保持 guest `192.168.1.204` 已被 pbridge 学习，关闭 `--arp-keepalive`，并执行：
+
+```sh
+adb shell 'dumpsys deviceidle force-idle'
+ip neigh del 192.168.1.204 dev eth0
+ping -I eth0 -c 5 -W 2 192.168.1.204
+```
+
+APF 启用时结果为 `0/5`，主机输出 `Destination Host Unreachable`。此时 APF 计数
+`DROPPED_ARP_OTHER_HOST` 从 92 增加到 99，pbridge 日志没有新的 `arp-proxy`，说明
+ARP request 在到达 `wlan0`/pbridge 之前已经被 APF/固件丢弃。
+
+随后只执行：
+
+```sh
+adb shell '/data/local/tmp/lpc_ctl.apf.final wlan0 apf-disable'
+ip neigh del 192.168.1.204 dev eth0
+ping -I eth0 -c 5 -W 2 192.168.1.204
+```
+
+结果恢复为 `5/5`，pbridge 日志出现：
+
+```text
+arp-proxy: 192.168.1.204 is-at e2:ec:48:c1:e3:79 -> 192.168.1.114
+```
+
+这次对照确认实际故障点是 APF/固件的 `DROPPED_ARP_OTHER_HOST`，不是
+`DROPPED_ICMP_ECHO`。因此只在 `DROPPED_ICMP_ECHO` 前加入放行条件不能修复该首包
+问题；要么让 APF 生成器对已安装的 guest `/32` 放行 ARP request，要么保留
+`--arp-keepalive 10`，从出向刷新上游邻居，避免设备在 Doze 中收到该 ARP request。
+
+> 注：这段结论只对当时那个 `mIPv4Address` 非 null 的程序成立。改用
+> `-m fwd-with-offload` 后 `wlan0` 上出现 guest 的 `/32`，`mIPv4Address` 变成
+> null，ARP request 分支变为无条件 pass，此时唯一的丢包点就是
+> `DROPPED_ICMP_ECHO`。见下面的“替换 APF 程序复测（2026-09-01 晚）”。
+
+测试结束后执行 `adb shell 'cmd deviceidle unforce'`，并重新启用 APF。
+
 ## 清理和恢复
 
 测试结束发送 SIGINT，pbridge 自动撤销 hook、路由和 mirror；然后删除临时对象：
@@ -344,8 +385,6 @@ IPv4 流量时的 host 首包直接成功；上游入向 ARP 代答仍用于外�
 guest，`--arp-keepalive 10` 仍用于规避 APF/firmware 前置丢包。验证结束后已清理
 临时 guest、veth、bridge、pbridge 进程和路由。
 
-## 结论和限制
-
 ## 开发机 Linux -> 安卓模拟 guest
 
 为验证真实外部 Linux 主机而不是 Android host 自身，使用开发机
@@ -401,6 +440,87 @@ pbvmbr-linux 192.168.1.204 -> 02:aa:bb:cc:dd:04 REACHABLE
 本次实机测试确认方案 2 在 Android 17（API 37）userspace、`android15-8` GKI 6.6
 arm64 内核上可工作：guest 出网、host -> guest、ARP 代理、guest MAC 隐藏和 10 秒
 keepalive 均通过。
+
+## 替换 APF 程序复测（2026-09-01 晚）
+
+按 `apf/README.md` 重跑 “替换 APF 程序 + pbridge，Linux -> 模拟 VM”。设备沿用上一轮
+仍在运行的会话，没有重建拓扑：
+
+```text
+pbridge  -i wlan0 -e ebpf -m fwd-with-offload -b pbvmbr --arp-keepalive 10 --timeout 60
+guest    netns pbtestns，pbg-guest 192.168.1.204/24，MAC 02:aa:bb:cc:dd:04
+上游     wlan0 192.168.1.39/24，HOSTMAC e2:ec:48:c1:e3:79
+开发机   Linux 192.168.1.114（eth0，同一 L2）
+```
+
+复测起点：guest -> 网关 `192.168.1.1` `2/2` 成功，`table 200` 里有
+`192.168.1.204 dev pbvmbr`，pbridge 日志有
+`vmroute add 192.168.1.204 -> 02:aa:bb:cc:dd:04 [route /32@table200, proxy@up0]`。
+
+### 1. 失败点不是 ARP，而是 ICMP echo
+
+清空开发机邻居后 `ping -c 5 192.168.1.204` 得到 `0/5`，但计数器显示：
+
+```text
+DROPPED_ARP_OTHER_HOST: 941 -> 941     # 没有动
+PASSED_ARP_REQUEST:    1054 -> 1055    # ARP request 放行了
+DROPPED_ICMP_ECHO:        (新出现) 5   # 正好等于 5 个 ping
+```
+
+开发机邻居项也正常解析成
+`192.168.1.204 lladdr e2:ec:48:c1:e3:79 REACHABLE`。所以 ARP 这一路是通的，
+和本文上面 “Doze/APF 前置过滤的决定性对照” 一节的结论不同。原因是
+`fwd-with-offload` 给 `wlan0` 加了 guest 的 `/32`，`wlan0` 上有两个 IPv4 地址，
+`ApfFilter` 的 `mIPv4Address` 变成 null（`dumpsys` 显示 `IPv4 address: None`），
+而 ARP request 丢弃分支只在 `mIPv4Address != null` 时才生成。
+
+两个补充对照：
+
+- 手机自己的 `192.168.1.39` 同样 `0/3`，说明这个 ICMP 丢弃与目的地址无关。
+- `cmd deviceidle unforce` 之后 `doze: FALSE`，仍然 ping 不通，说明它不受 Doze
+  门控。
+
+同时确认 **Linux -> guest 的 TCP 一直可用**：在 guest netns 里
+`toybox nc -L -p 9099 -s 192.168.1.204`，开发机 `/dev/tcp` 连上直接读到
+`GUEST_TCP_OK`。pbridge 的转发路径没有问题。
+
+### 2. 补丁后的实测结果
+
+从设备现场抓当前程序，在 `drop counter=21`（`DROPPED_ICMP_ECHO`）之前插入
+`ldw r0,[30]` + `jeq r0, 192.168.1.204, PASS`，用
+`apf/tools/apf_live_test.sh` 交替安装两轮：
+
+| 安装的程序 | Linux -> guest | Linux -> 手机 | `DROPPED_ICMP_ECHO` |
+| --- | --- | --- | --- |
+| 原始 996 bytes | `0/5` | `0/3` | +8 |
+| 补丁 1007 bytes | `5/5` | `0/3` | +3 |
+| 原始 996 bytes | `0/5` | `0/3` | +8 |
+| 补丁 1007 bytes | `5/5` | `0/3` | +3 |
+
+用完全相同的 `apf-disable`/`apf-set`/`apf-enable` 流程装未打补丁的程序仍是 `0/5`，
+因此恢复连通的是补丁内容，不是 disable/enable 动作。补丁生效期间 guest 的 TCP
+仍然正常（`GUEST_TCP_OK`），ping 也稳定在 `3/3`。
+
+### 3. 覆盖寿命
+
+`APF_PROGRAM_ID` 写死在程序里，可用来判断固件跑的是谁的程序：
+
+- 静置 2 分钟以上 ID 停在 50，ping 持续 `2/2`；
+- 一次 `dumpsys deviceidle force-idle` 让 NetworkStack 重新生成
+  （`Program updates 50 -> 51`），ping 立刻回到 `0/5`；
+- 从新的 1001-byte 程序重新打补丁装上（1012 bytes），在 deep `IDLE`、
+  `doze: TRUE` 下恢复 `5/5`，手机仍 `0/3`。
+
+### 4. 复测后的状态
+
+`cmd deviceidle unforce`，`apf-disable` + `apf-enable`，并触发一次 NetworkStack
+重新生成，恢复到 stock 程序（`Program updates: 54`，996 bytes，
+`Filter update status: RUNNING`）。此时 guest 和手机的 ping 都回到 `0/2`，
+guest TCP 仍为 `GUEST_TCP_OK`。pbridge 进程、`pbtestns`、`pbvmbr` 和
+`table 200` 全部保持复测前的状态，没有拆除。
+
+证据在 `apf/evidence/`：`apf-icmp.*` 和 `apf-doze.*`（现场程序、补丁程序及各自
+反汇编）、`ctrs-*-{before,after}.txt`、`ping-*.txt`。
 
 本次使用临时 netns 代替真实 pKVM guest，因此尚未覆盖真实 VM 的 DHCP、IPv6 SLAAC
 和多 guest 并发；这些路径已由项目的 netns 自动化测试覆盖。真实设备上若启用
