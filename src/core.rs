@@ -206,6 +206,13 @@ pub async fn run(cli: Cli) -> Result<()> {
     if core.cli.offload_workaround.is_some() && !core.is_fwd() {
         log::warn!("--offload-workaround is set but mode is direct; ignoring (fwd-mode only)");
     }
+    if core.cli.offload_workaround.is_some_and(|f| f.v4) {
+        log::warn!(
+            "--offload-workaround v4 is ignored: guest IPv4 ARP is handled by the APF patch \
+             path, and a guest /32 on up0 would make NetworkStack reinstall its program on \
+             every learn (see offload_family_selected)"
+        );
+    }
 
     // Attempt initial session (up0 may already be present).
     if let Err(e) = core.on_netlink_change().await {
@@ -242,7 +249,11 @@ pub async fn run(cli: Cli) -> Result<()> {
     // loop iteration re-arms and runs again — that is the "repatch once more if it was
     // overwritten mid-transaction" requirement, without a second timer.
     let apf_debounce = Duration::from_millis(core.cli.apf_watchdog_debounce_ms);
-    let apf_enabled = core.apf.is_some();
+    // Gates the kprobe-event arm and the repatch timer. Must follow the *channel*, not
+    // `core.apf`: in in-flight mode `core.apf` is Some but every Sender was dropped above,
+    // so `apf_rx.recv()` would resolve to `None` instantly on every iteration and the
+    // select loop would spin at 100% CPU. Cleared for good if the channel ever closes.
+    let mut apf_enabled = apf_tx.is_some();
     // Either method may have fixed addresses whose MAC is not known yet.
     let apf_discovery_enabled = !core.apf_discovery_targets().is_empty();
     let mut apf_deadline: Option<tokio::time::Instant> = None;
@@ -318,8 +329,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                     None => {
                         // The ringbuf reader is gone (backend torn down): nothing can
-                        // notify us any more, so cancel any pending retry.
+                        // notify us any more, so cancel any pending retry and disable this
+                        // arm: a closed receiver is permanently ready and would spin the loop.
                         apf_deadline = None;
+                        apf_enabled = false;
                     }
                 }
             }
@@ -1057,10 +1070,16 @@ impl Core {
                 crate::cli::APF_WATCHDOG_MAX_GUESTS
             );
         }
-        let changed = wd.dhcp_leases.insert(client_mac, lease_ip) != Some(lease_ip);
+        let changed = wd.dhcp_leases.get(&client_mac) != Some(&lease_ip);
         // DHCPACK carries the server-authoritative address and the client's chaddr. Learn
         // immediately so the just-ACKed guest is demuxable before its first GARP/data frame.
+        // Learn BEFORE recording the lease: if reconcile fails here the ACK must still look
+        // new next time, or the lease would be on file with no repatch ever issued for it.
         self.do_learn(IpAddr::V4(lease_ip), client_mac).await?;
+        let Some(wd) = &mut self.apf else {
+            return Ok(());
+        };
+        wd.dhcp_leases.insert(client_mac, lease_ip);
         if changed {
             if self.apf_use_inflight {
                 // In-flight mode: hand the new set to the tracer for future installs, and
@@ -1079,6 +1098,30 @@ impl Core {
             }
         }
         Ok(())
+    }
+
+    /// Aging evicted these entries. Drop any automatic DHCP lease pointing at them and shrink
+    /// the APF pass-list to match: a lease with no live guest behind it would otherwise stay
+    /// in the firmware forever, and after eight such ghosts the 8-lease cap would refuse
+    /// every new guest until restart.
+    async fn apf_leases_expired(&mut self, dead: &[IpAddr]) {
+        let Some(wd) = &mut self.apf else { return };
+        if !matches!(wd.mode, ApfWatchdogMode::Dhcp) || dead.is_empty() {
+            return;
+        }
+        let before = wd.dhcp_leases.len();
+        wd.dhcp_leases
+            .retain(|_, ip| !dead.contains(&IpAddr::V4(*ip)));
+        let dropped = before - wd.dhcp_leases.len();
+        if dropped == 0 {
+            return;
+        }
+        log::info!("apf: {dropped} DHCP lease(s) expired with their guest entries; shrinking the APF pass-list");
+        if self.apf_use_inflight {
+            self.apf_inflight_guests_changed("DHCP lease expiry").await;
+        } else {
+            self.apf_repatch("DHCP lease expiry").await;
+        }
     }
 
     async fn do_learn(&mut self, ip: IpAddr, mac: Mac) -> Result<()> {
@@ -1351,12 +1394,17 @@ impl Core {
             return Ok(());
         }
         let alive: HashSet<IpAddr> = self.backend.flush()?.into_iter().collect();
-        let dead: Vec<IpAddr> =
-            self.entries.ips().into_iter().filter(|ip| !alive.contains(ip)).collect();
-        for ip in dead {
-            self.entries.remove(&ip);
-            self.reconcile(ip).await?; // entry gone → withdraw
+        let dead: Vec<IpAddr> = self
+            .entries
+            .ips()
+            .into_iter()
+            .filter(|ip| !alive.contains(ip))
+            .collect();
+        for ip in &dead {
+            self.entries.remove(ip);
+            self.reconcile(*ip).await?; // entry gone → withdraw
         }
+        self.apf_leases_expired(&dead).await;
         Ok(())
     }
 

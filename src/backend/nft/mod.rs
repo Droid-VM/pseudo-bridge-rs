@@ -661,12 +661,10 @@ fn drop_src(mac: Mac) -> Vec<Vec<u8>> {
 }
 
 fn out_rules_fwd(hostmac: Mac, brmac: Option<Mac>, group: u16, up0: u32) -> Vec<Vec<Vec<u8>>> {
-    // Host-originated packets that the up0 egress demux redirected back to fwd0 carry
-    // HOSTMAC as their source. Let only known guest destinations through; all other
-    // HOSTMAC traffic is still rejected below so bridge flood copies cannot leak out.
-    let mut rules = host_probe_fwd_allow(hostmac);
-    rules.extend(host_to_guest_fwd_allow(hostmac));
-    rules.push(drop_src(hostmac));
+    // src == HOSTMAC on fwd0 ingress is never legitimate: host frames demuxed into fwd0
+    // by the up0 egress guard leave through fwd0 egress into fwd1 and never re-enter here,
+    // so a match is a bridge flood copy or a guest forging our MAC. Unconditional drop.
+    let mut rules = vec![drop_src(hostmac)];
     if let Some(b) = brmac {
         rules.push(drop_src(b));
     }
@@ -676,53 +674,6 @@ fn out_rules_fwd(hostmac: Mac, brmac: Option<Mac>, group: u16, up0: u32) -> Vec<
     rules.push(valid_rule(Family::V6, hostmac, term_fwd(up0)));
     rules.push(arp_out_rule(hostmac, group, term_fwd(up0)));
     rules.push(else_out_rule(hostmac, group, term_fwd(up0)));
-    rules
-}
-
-/// Allow the anonymous ARP/NS copies made by the up0 discovery guard. They retain
-/// HOSTMAC as their L2 source but are intentionally addressed to the guest bridge;
-/// ordinary HOSTMAC flood copies still fall through to `drop_src` below.
-fn host_probe_fwd_allow(hostmac: Mac) -> Vec<Vec<Vec<u8>>> {
-    let mut rules = Vec::new();
-    let mut arp = vec![payload_load(NFT_PAYLOAD_LL_HEADER, LL_SRC, 6, NFT_REG_1)];
-    arp.push(cmp(NFT_REG_1, NFT_CMP_EQ, hostmac.bytes()));
-    arp.extend(eth_gate(ETH_ARP));
-    arp.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, ARP_OP, 2, NFT_REG_1));
-    arp.push(cmp(NFT_REG_1, NFT_CMP_EQ, &1u16.to_be_bytes()));
-    arp.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, ARP_SPA, 4, NFT_REG_1));
-    arp.push(cmp(NFT_REG_1, NFT_CMP_EQ, &[0u8; 4]));
-    arp.push(verdict(NF_ACCEPT, None));
-    rules.push(arp);
-
-    let mut ns = vec![payload_load(NFT_PAYLOAD_LL_HEADER, LL_SRC, 6, NFT_REG_1)];
-    ns.push(cmp(NFT_REG_1, NFT_CMP_EQ, hostmac.bytes()));
-    ns.extend(eth_gate(ETH_IP6));
-    ns.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, V6_SADDR, 16, NFT_REG_1));
-    ns.push(cmp(NFT_REG_1, NFT_CMP_EQ, &[0u8; 16]));
-    ns.extend(l4_gate(L4_ICMPV6));
-    ns.push(payload_load(NFT_PAYLOAD_TRANSPORT_HEADER, TH_ICMP_TYPE, 1, NFT_REG_1));
-    ns.push(cmp(NFT_REG_1, NFT_CMP_EQ, &[135]));
-    ns.push(verdict(NF_ACCEPT, None));
-    rules.push(ns);
-    rules
-}
-
-fn host_to_guest_fwd_allow(hostmac: Mac) -> Vec<Vec<Vec<u8>>> {
-    let mut rules = Vec::new();
-    for (eth, saddr, daddr, len, host, host_sid, map, map_sid) in [
-        (ETH_IP4, V4_SADDR, V4_DADDR, 4u32, "host4", SID_HOST4, "ip2mac4", SID_IP2MAC4),
-        (ETH_IP6, V6_SADDR, V6_DADDR, 16u32, "host6", SID_HOST6, "ip2mac6", SID_IP2MAC6),
-    ] {
-        let mut r = vec![payload_load(NFT_PAYLOAD_LL_HEADER, LL_SRC, 6, NFT_REG_1)];
-        r.push(cmp(NFT_REG_1, NFT_CMP_EQ, hostmac.bytes()));
-        r.extend(eth_gate(eth));
-        r.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, saddr, len, NFT_REG_1));
-        r.push(lookup(host, host_sid, NFT_REG_1, None));
-        r.push(payload_load(NFT_PAYLOAD_NETWORK_HEADER, daddr, len, NFT_REG_1));
-        r.push(lookup(map, map_sid, NFT_REG_1, Some(NFT_REG_1)));
-        r.push(verdict(NF_ACCEPT, None));
-        rules.push(r);
-    }
     rules
 }
 

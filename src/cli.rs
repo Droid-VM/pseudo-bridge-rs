@@ -195,6 +195,10 @@ pub struct Cli {
     /// guest's behalf with HOSTMAC. The magic-metric tag keeps these addresses
     /// distinguishable from the host's real ones (excluded from host-ip detection and the
     /// bridge mirror). Off unless set; inert in direct mode. e.g. `--offload-workaround v6`.
+    ///
+    /// `v4` is accepted for compatibility but no longer does anything: guest IPv4 ARP is
+    /// handled by the APF patch path instead, and a guest `/32` on wlan0 would make
+    /// NetworkStack regenerate its ARP program on every learn. pbridge warns and ignores it.
     #[arg(long = "offload-workaround")]
     pub offload_workaround: Option<OffloadFamilies>,
 

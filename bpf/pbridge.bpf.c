@@ -155,10 +155,13 @@ static __always_inline int out_common(struct __sk_buff *skb, int is_direct) {
 #define TERM (is_direct ? TC_ACT_OK : bpf_redirect(to, 0))
 
     if (mac_eq(src, c->hostmac)) {
-        // In fwd mode this is the host-originated packet that egress_guard already
-        // demuxed to a learned guest. Locally-generated skbs retain ingress_ifindex=0;
-        // bridge flood copies and guest-originated redirects do not.
-        if (skb->ingress_ifindex == 0) return TC_ACT_OK;
+        // direct: OUT is up0 egress, so a locally generated skb (ingress_ifindex == 0) is
+        // the host itself and passes; a bridged copy from a guest port does not.
+        // fwd: OUT is fwd0 INGRESS, where ingress_ifindex is never 0. Host-originated
+        // frames demuxed into fwd0 by egress_guard leave through fwd0 egress into fwd1 and
+        // never come back here, so anything with src == HOSTMAC on this hook is a bridge
+        // flood copy or a guest forging our MAC: always drop.
+        if (is_direct) return (skb->ingress_ifindex == 0) ? TC_ACT_OK : TC_ACT_SHOT;
         return TC_ACT_SHOT;
     }
     if (!is_direct && c->has_brmac && mac_eq(src, c->brmac)) return TC_ACT_SHOT;

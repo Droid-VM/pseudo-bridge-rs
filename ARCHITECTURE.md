@@ -26,7 +26,7 @@ multi-guest 共用一個「只認得單一 mac」的上游口(Wi-Fi STA、或被
         --nflog-group       nft NFLOG group(下文 <g>);預設 32123
         --timeout           entry idle 老化秒數;預設 30s
         --max-cap           entry 上限 = v4_per_mac, v6_per_mac, v4_global, v6_global;預設 16,64,256,1024
-        --offload-workaround       ND/ARP offload 繞道,逗號子集 v4,v6,v6ll(僅 fwd mode 生效;見 §ND/ARP offload 繞道)
+        --offload-workaround       ND/ARP offload 繞道,逗號子集 v4,v6,v6ll(僅 fwd mode 生效;見 §ND/ARP offload 繞道)。`v4` 僅為相容保留:guest v4 ARP 改由 APF patch 處理,傳入會 warn 並忽略
         --offload-workaround-magic 上述繞道在 up0 上代理位址的 IFA_RT_PRIORITY 魔術標記;預設 4243672773(接受十進位或 0x 十六進位)
         --arp-keepalive     週期性 v4 ARP keepalive 秒數;`0`=關(預設)。對 up0 每個 v4 鄰居替每個已學 guest v4 發單播 ARP reply
                             (+ 週期 GARP),讓上游鄰居快取常駐 REACHABLE、永不需要對 guest 發 ARP request——繞過 Wi-Fi 韌體
@@ -486,9 +486,10 @@ if locally-originated && ip.dst ∈ ip2mac:
 ```
 
 eBPF 用 `skb->ingress_ifindex == 0` 区分 host 本地包；nft 用 `ip.src ∈ host4/host6`
-做等价过滤。重定向包在 fwd0 OUT 侧放行已知 guest 目标，其他 `HOSTMAC` bridge
-flood 仍由原有 guard 丢弃。这样首个 host ping 不再依赖第二次重试；guest 尚未学习
-时仍由 discovery ARP/NS probe 触发学习。
+做等价过滤。重定向包从 fwd0 **egress** 送出、经 fwd1 进入 bridge，不会再经过 fwd0
+ingress 的 OUT 链，因此 OUT 链对 `src == HOSTMAC` 仍是无条件 drop，无需任何放行。
+这样首个 host ping 不再依赖第二次重试；guest 尚未学习时仍由 discovery ARP/NS probe
+触发学习。
 
 ### host → VM 路由
 

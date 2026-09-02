@@ -532,7 +532,20 @@ fn remove_arp_rules(prog: &[u8], insns: &[Insn], guests: &[Ipv4Addr]) -> Result<
     let Some((start, end)) = range else {
         bail!("cannot locate the byte-identical pbridge ARP insertion to replace");
     };
-    remove_insertion(prog, insns, start, end)
+    let stock = remove_insertion(prog, insns, start, end)?;
+    // Guard against mistaking the vendor's own rule for ours. A `jeq r0,<phone ip>,PASS`
+    // emitted by the generator is byte-identical to one of our jeqs (same 4-byte encoding),
+    // so shape alone cannot tell them apart. What can: after stripping OUR run, the vendor's
+    // `ldw [38] / cmp / drop` branch must still be intact. If it is not, we just removed the
+    // phone's own ARP compare, and writing that back would make the phone unreachable.
+    let stock_insns = parse(&stock)?;
+    if let Err(e) = find_arp_request_drop_site(&stock, &stock_insns) {
+        bail!(
+            "refusing to strip ARP rules: the remaining program has no vendor ARP request \
+             site, so the run was probably the firmware's own rule ({e})"
+        );
+    }
+    Ok(stock)
 }
 
 fn remove_insertion(prog: &[u8], insns: &[Insn], start: usize, end: usize) -> Result<Vec<u8>> {
@@ -1040,6 +1053,35 @@ mod tests {
             find_our_arp_rules(&second, &si).unwrap(),
             Some(vec![ip("192.168.1.7"), ip("192.168.1.9")])
         );
+    }
+
+    /// A vendor `jeq r0,<phone ip>,PASS` is byte-identical to one of our jeqs. If a build
+    /// ever emits that shape, the detector would claim it as ours and strip the phone's own
+    /// ARP compare. The guard in `remove_arp_rules` must refuse instead of writing that back.
+    #[test]
+    fn vendor_own_ip_compare_targeting_pass_is_not_stripped() {
+        let insns = parse(PROG19).unwrap();
+        let site = find_arp_request_drop_site(PROG19, &insns).unwrap();
+        // The vendor compare is the instruction right before the drop.
+        let k = insns.iter().position(|i| i.start == site.insert_at).unwrap();
+        let cmp = &insns[k - 1];
+        assert_eq!(cmp.opcode, JEQ);
+        assert_eq!(cmp.jump_imm_len, 4);
+        let mut prog = PROG19.to_vec();
+        let off = (prog.len() - cmp.end) as u32;
+        let at = cmp.jump_imm_at.unwrap();
+        prog[at..at + 4].copy_from_slice(&off.to_be_bytes());
+        let pi = parse(&prog).unwrap();
+        assert_eq!(pi[k - 1].target, Some(prog.len()), "premise: now targets PASS");
+        assert!(
+            find_our_arp_rules(&prog, &pi).unwrap().is_some(),
+            "premise: shape alone cannot tell the vendor rule from ours"
+        );
+
+        let err = plan_with_arp(&prog, debugbuf_of(&prog).unwrap(), &[ip("10.0.0.1")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing to strip"), "{err}");
     }
 
     /// Both sites absent is the one case that must still fail, and the error has to name both
