@@ -25,9 +25,37 @@
 //!
 //! No shelling out, no `lpc_ctl`, no `dumpsys`: [`vendor`] speaks the QCA nl80211 vendor
 //! command directly, and the program length is derived from the work memory itself.
+//!
+//! # The two methods
+//!
+//! Everything above describes `--apf-method watchdog`, the default, implemented by
+//! [`repatch()`]. The alternative is `--apf-method inflight` ([`inflight`]), which ptraces
+//! the Wi-Fi HAL and rewrites the program inside its `sendmsg` before the kernel sees it.
+//! They are mutually exclusive — running both would double-patch, and each one's
+//! "already carries our rules" check would trip over the other's work.
+//!
+//! | | `watchdog` | `inflight` |
+//! |---|---|---|
+//! | when | after the install | before the install |
+//! | window | debounce + one transaction | none |
+//! | proof | firmware readback | tracee-buffer readback |
+//! | needs | BPF kprobe | CAP_SYS_PTRACE on `hal_wifi_default` |
+//! | addresses | fixed or DHCP-derived | fixed or DHCP-derived |
+//! | declined install | repaired late | left unpatched |
+//!
+//! In DHCP mode the in-flight tracer reads a shared address set that the control-plane actor
+//! updates on each validated DHCPACK, so nothing blocks inside the stopped syscall. A lease
+//! change additionally runs one [`repatch()`] transaction, which is the only time in-flight
+//! mode touches the firmware: without it a new guest would wait for NetworkStack's next
+//! install to get its rule.
+//!
+//! Both share the planner ([`patch::plan_with_arp`]) and the debugbuf derivation
+//! ([`program::debugbuf_of`]), so the bytes they produce for a given program are identical.
 
+pub mod inflight;
 pub mod patch;
 pub mod program;
+pub mod setmsg;
 pub mod vendor;
 
 use anyhow::{bail, Context, Result};

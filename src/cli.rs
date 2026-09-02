@@ -254,6 +254,51 @@ pub struct Cli {
     /// commands into a single repatch transaction.
     #[arg(long = "apf-watchdog-debounce-ms", default_value_t = 200)]
     pub apf_watchdog_debounce_ms: u64,
+
+    /// How to keep the APF pass rules alive. Only meaningful together with
+    /// `--apf-watchdog`/`--apf-watchdog-guest`; the two methods are mutually exclusive.
+    ///
+    /// `watchdog` (default) repairs the program *after* NetworkStack installs it.
+    /// `inflight` rewrites it *before* the kernel sees it, which removes the repair
+    /// window but cannot fix an install it declines to patch. See [`ApfMethod`].
+    #[arg(long = "apf-method", value_enum, default_value_t = ApfMethod::Watchdog)]
+    pub apf_method: ApfMethod,
+}
+
+/// Which mechanism maintains the APF pass rules. Mutually exclusive: each has a failure mode
+/// the other does not, so running both would double-patch and confuse the "already ours"
+/// detection.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ApfMethod {
+    /// React after the fact. A BPF kprobe on the driver's APF vendor-command entry point
+    /// notices an external install, then pbridge runs
+    /// `disable → read → patch → write → read back → enable` against the firmware's work
+    /// memory.
+    ///
+    /// Trade-off: there is a live window — the debounce plus one transaction — where the
+    /// unpatched program runs. In exchange it repairs *any* install it can parse, whatever
+    /// shape it arrives in, and it proves the result by reading the program back out of the
+    /// firmware.
+    Watchdog,
+    /// Intercept and rewrite in flight. ptrace the Wi-Fi HAL (the process that actually
+    /// issues the vendor command — NetworkStack only computes the bytes and passes them down
+    /// via AIDL), stop it at `sendmsg` entry, and patch the program inside its own buffer.
+    ///
+    /// Trade-off: no window at all, and no firmware readback either — correctness rests on
+    /// the offline-verified patcher plus a readback of the tracee's buffer. It declines
+    /// anything it cannot patch safely (a fragmented install, no headroom in the HAL's
+    /// buffer, a program with no drop site) and lets the stock program through, so those
+    /// installs go unpatched entirely rather than being repaired late.
+    ///
+    /// Works with either address mode. With `--apf-watchdog` the tracer reads whichever
+    /// DHCP-derived set is current when an install arrives; a lease change also triggers one
+    /// repatch transaction so the already-installed program picks up the new address instead
+    /// of waiting for NetworkStack's next install.
+    ///
+    /// Needs CAP_SYS_PTRACE and permission to ptrace the `hal_wifi_default` domain. Uses
+    /// PTRACE_SEIZE, so if pbridge dies the kernel resumes the HAL rather than leaving it
+    /// stopped.
+    Inflight,
 }
 
 /// Max APF watchdog guest addresses. Each costs 9 program bytes (a `jeq r0,<ip>,PASS`)
@@ -299,6 +344,41 @@ pub fn validate_apf_watchdog(cli: &Cli) -> Result<ApfWatchdogMode, String> {
     // Sorted: the patcher emits one jeq per address in this order, so the generated
     // program (and therefore the readback compare) is independent of CLI argument order.
     Ok(ApfWatchdogMode::Fixed(seen.into_iter().collect()))
+}
+
+/// The APF feature resolved into "which method, over which addresses".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApfPlan {
+    Off,
+    /// Kprobe plus repatch transactions. Carries the watchdog's own mode, which may derive
+    /// addresses from DHCP.
+    Watchdog(ApfWatchdogMode),
+    /// ptrace the Wi-Fi HAL. Carries the same address mode as the watchdog: a DHCP-derived
+    /// list works here too, because observing a lease is asynchronous — the tracer reads
+    /// whatever set is current when an install arrives, and a lease change corrects the
+    /// already-installed program through one repatch transaction.
+    Inflight(ApfWatchdogMode),
+}
+
+/// Resolve `--apf-method` against the address configuration.
+pub fn validate_apf_plan(cli: &Cli) -> Result<ApfPlan, String> {
+    let mode = validate_apf_watchdog(cli)?;
+    if mode == ApfWatchdogMode::Off {
+        // A method without any addresses is not an error, just nothing to do — but say so,
+        // because "I passed --apf-method inflight and nothing happened" is otherwise silent.
+        if cli.apf_method != ApfMethod::Watchdog {
+            return Err(
+                "--apf-method inflight has no effect without --apf-watchdog or \
+                 --apf-watchdog-guest"
+                    .into(),
+            );
+        }
+        return Ok(ApfPlan::Off);
+    }
+    match cli.apf_method {
+        ApfMethod::Watchdog => Ok(ApfPlan::Watchdog(mode)),
+        ApfMethod::Inflight => Ok(ApfPlan::Inflight(mode)),
+    }
 }
 
 /// Parse a u32 magic value as decimal or 0x-prefixed hex.
@@ -365,6 +445,7 @@ mod tests {
             apf_watchdog: false,
             apf_watchdog_guest: vec![],
             apf_watchdog_debounce_ms: 200,
+            apf_method: ApfMethod::Watchdog,
         };
         assert_eq!(cli.fwd0(), "wlan0verylon-if");
         assert_eq!(cli.fwd1(), "wlan0verylon-br");
@@ -457,6 +538,117 @@ mod tests {
         let cli = parse_args(&["--apf-watchdog"]).unwrap();
         assert_eq!(validate_apf_watchdog(&cli), Ok(ApfWatchdogMode::Dhcp));
         assert!(parse_args(&["--apf-watchdog", "--apf-watchdog-guest", "192.168.1.204"]).is_err());
+    }
+
+    #[test]
+    fn apf_method_defaults_to_watchdog_and_off_means_off() {
+        let cli = parse_args(&[]).unwrap();
+        assert_eq!(cli.apf_method, ApfMethod::Watchdog);
+        assert_eq!(validate_apf_plan(&cli), Ok(ApfPlan::Off));
+    }
+
+    #[test]
+    fn apf_method_selects_between_the_two_mechanisms() {
+        let wd = parse_args(&["--apf-watchdog-guest", "192.168.1.204"]).unwrap();
+        assert_eq!(
+            validate_apf_plan(&wd),
+            Ok(ApfPlan::Watchdog(ApfWatchdogMode::Fixed(vec![
+                "192.168.1.204".parse().unwrap()
+            ])))
+        );
+
+        let inf = parse_args(&[
+            "--apf-method",
+            "inflight",
+            "--apf-watchdog-guest",
+            "192.168.1.204",
+        ])
+        .unwrap();
+        assert_eq!(
+            validate_apf_plan(&inf),
+            Ok(ApfPlan::Inflight(ApfWatchdogMode::Fixed(vec![
+                "192.168.1.204".parse().unwrap()
+            ])))
+        );
+    }
+
+    /// DHCP-derived addresses work with either method: observing a lease is asynchronous, so
+    /// the in-flight tracer can read an updated set without ever blocking a syscall.
+    #[test]
+    fn apf_method_inflight_accepts_dhcp_mode() {
+        let cli = parse_args(&["--apf-method", "inflight", "--apf-watchdog"]).unwrap();
+        assert_eq!(
+            validate_apf_plan(&cli),
+            Ok(ApfPlan::Inflight(ApfWatchdogMode::Dhcp))
+        );
+    }
+
+    /// The two methods must never both be live: they would double-patch, and each one's
+    /// "already carries our rules" check would see the other's work.
+    #[test]
+    fn apf_plan_is_exactly_one_mechanism() {
+        for args in [
+            vec!["--apf-watchdog-guest", "192.168.1.204"],
+            vec![
+                "--apf-method",
+                "inflight",
+                "--apf-watchdog-guest",
+                "192.168.1.204",
+            ],
+            vec!["--apf-watchdog"],
+        ] {
+            let cli = parse_args(&args).unwrap();
+            let plan = validate_apf_plan(&cli).unwrap();
+            let watchdog_live = matches!(plan, ApfPlan::Watchdog(_));
+            let inflight_live = matches!(plan, ApfPlan::Inflight(_));
+            assert!(
+                watchdog_live ^ inflight_live,
+                "exactly one mechanism must be live for {args:?}, got {plan:?}"
+            );
+        }
+    }
+
+    /// A method with no address configuration at all is rejected rather than silently doing
+    /// nothing — the failure mode it prevents is "I passed the flag and saw no effect".
+    #[test]
+    fn apf_method_inflight_needs_some_address_source() {
+        let bare = parse_args(&["--apf-method", "inflight"]).unwrap();
+        let err = validate_apf_plan(&bare).expect_err("must reject a bare method");
+        assert!(err.contains("no effect"), "{err}");
+    }
+
+    #[test]
+    fn apf_method_inflight_returns_the_sorted_guest_list() {
+        let cli = parse_args(&[
+            "--apf-method",
+            "inflight",
+            "--apf-watchdog-guest",
+            "192.168.1.204",
+            "--apf-watchdog-guest",
+            "192.168.1.153",
+        ])
+        .unwrap();
+        assert_eq!(
+            validate_apf_plan(&cli),
+            Ok(ApfPlan::Inflight(ApfWatchdogMode::Fixed(vec![
+                "192.168.1.153".parse().unwrap(),
+                "192.168.1.204".parse().unwrap()
+            ]))),
+            "addresses must come back sorted, like the watchdog's"
+        );
+    }
+
+    #[test]
+    fn apf_method_inflight_rejects_nft_engine() {
+        let mut cli = parse_args(&[
+            "--apf-method",
+            "inflight",
+            "--apf-watchdog-guest",
+            "192.168.1.204",
+        ])
+        .unwrap();
+        cli.engine = Engine::Nft;
+        assert!(validate_apf_plan(&cli).is_err());
     }
 
     #[test]

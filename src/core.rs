@@ -76,6 +76,12 @@ pub struct Core {
     keepalive_tick: u64,              // counts --arp-keepalive ticks (GARP every Nth)
     apf: Option<ApfWatchdog>,         // --apf-watchdog-guest state (ebpf only)
     apf_discovery_ticks: u64, // cold-start ticks since an explicit APF guest was last unresolved
+    /// `--apf-method inflight`: patch inside the HAL's `sendmsg` instead of repairing after
+    /// the install. The address source is the same `apf` bookkeeping either way.
+    apf_use_inflight: bool,
+    /// Live ptrace session against the Wi-Fi HAL. Seized at session init and dropped at
+    /// teardown; dropping it detaches every thread.
+    apf_inflight: Option<apf::inflight::Handle>,
 }
 
 /// APF watchdog state. Present iff `--apf-watchdog-guest` was given; the vendor socket is
@@ -116,8 +122,20 @@ const GARP_EVERY: u64 = 3;
 
 pub async fn run(cli: Cli) -> Result<()> {
     // Reject an unsupported combination before touching the kernel.
-    let apf_mode = crate::cli::validate_apf_watchdog(&cli).map_err(|e| anyhow!(e))?;
-    let apf_enabled_cfg = !matches!(apf_mode, ApfWatchdogMode::Off);
+    let apf_plan = crate::cli::validate_apf_plan(&cli).map_err(|e| anyhow!(e))?;
+    // Both methods share the address bookkeeping (fixed list or observed DHCP leases) and
+    // the vendor socket, so `apf_mode` is whichever mode was configured regardless of method.
+    // What the method decides is whether the kprobe is armed: in-flight mode has no use for
+    // overwrite notifications, and arming it anyway would spend a BPF program and a ringbuf
+    // reader on events nothing consumes.
+    let apf_mode = match &apf_plan {
+        crate::cli::ApfPlan::Off => ApfWatchdogMode::Off,
+        crate::cli::ApfPlan::Watchdog(m) | crate::cli::ApfPlan::Inflight(m) => m.clone(),
+    };
+    let apf_configured = !matches!(apf_mode, ApfWatchdogMode::Off);
+    let use_inflight = matches!(apf_plan, crate::cli::ApfPlan::Inflight(_));
+    // Gates the kprobe and its ringbuf channel: watchdog method only.
+    let apf_enabled_cfg = apf_configured && !use_inflight;
 
     let net = Net::connect()?;
     let mut nl_rx = Net::monitor()?;
@@ -156,7 +174,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         aging_tick: 0,
         skip_flush_once: false,
         keepalive_tick: 0,
-        apf: apf_enabled_cfg.then(|| ApfWatchdog {
+        // Present for either method: it carries the mode, the DHCP lease table and the vendor
+        // socket, all of which in-flight mode needs too (the socket to correct an already
+        // installed program when a lease changes).
+        apf: apf_configured.then(|| ApfWatchdog {
             mode: apf_mode.clone(),
             dhcp_leases: HashMap::new(),
             dhcp_pending: HashMap::new(),
@@ -165,13 +186,22 @@ pub async fn run(cli: Cli) -> Result<()> {
             failures: 0,
         }),
         apf_discovery_ticks: 0,
+        apf_use_inflight: use_inflight,
+        apf_inflight: None,
     };
-    if apf_enabled_cfg {
-        log::info!(
-            "apf-watchdog: enabled in {:?} mode, debounce {}ms",
-            apf_mode,
+    // Name the live method explicitly. The two are exclusive, and "which one is running"
+    // decides whether a missed install gets repaired late or not at all.
+    match &apf_plan {
+        crate::cli::ApfPlan::Off => {}
+        crate::cli::ApfPlan::Watchdog(m) => log::info!(
+            "apf: method=watchdog (repair after install, kprobe armed) in {m:?} mode, \
+             debounce {}ms",
             core.cli.apf_watchdog_debounce_ms
-        );
+        ),
+        crate::cli::ApfPlan::Inflight(m) => log::info!(
+            "apf: method=inflight (rewrite before install, ptrace the Wi-Fi HAL) in {m:?} mode \
+             — kprobe NOT armed; installs it declines to patch go out stock"
+        ),
     }
     if core.cli.offload_workaround.is_some() && !core.is_fwd() {
         log::warn!("--offload-workaround is set but mode is direct; ignoring (fwd-mode only)");
@@ -213,6 +243,8 @@ pub async fn run(cli: Cli) -> Result<()> {
     // overwritten mid-transaction" requirement, without a second timer.
     let apf_debounce = Duration::from_millis(core.cli.apf_watchdog_debounce_ms);
     let apf_enabled = core.apf.is_some();
+    // Either method may have fixed addresses whose MAC is not known yet.
+    let apf_discovery_enabled = !core.apf_discovery_targets().is_empty();
     let mut apf_deadline: Option<tokio::time::Instant> = None;
 
     // Cold-start discovery for explicitly configured APF guests. This is separate from
@@ -268,9 +300,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             _ = keepalive.tick(), if ka_enabled => {
                 if let Err(e) = core.on_arp_keepalive().await { log::warn!("arp-keepalive: {e:#}"); }
             }
-            _ = apf_discovery.tick(), if apf_enabled => {
+            // Cold-start discovery serves the datapath, not the patcher, so it runs for
+            // either method — unlike the repatch arm below, which is watchdog-only.
+            _ = apf_discovery.tick(), if apf_discovery_enabled => {
                 if let Err(e) = core.on_apf_discovery_tick() {
-                    log::warn!("apf-watchdog discovery: {e:#}");
+                    log::warn!("apf discovery: {e:#}");
                 }
             }
             ev = apf_rx.recv(), if apf_enabled => {
@@ -590,7 +624,9 @@ impl Core {
             hostmac,
             brmac: snap.brmac,
             host_ips: snap.host_ips.iter().map(|a| a.ip).collect(),
-            apf_watchdog: self.apf.is_some(),
+            // Means "arm the kprobe", which is the watchdog method only — `self.apf` is
+            // Some for either method now, since both need its address bookkeeping.
+            apf_watchdog: self.apf.is_some() && !self.apf_use_inflight,
         };
 
         self.injector = Some(Injector::new(snap.up0_index)?);
@@ -607,6 +643,9 @@ impl Core {
         // events can reach us) and up0's ifindex known. The first repatch runs immediately
         // — the live program is whatever NetworkStack installed before we started.
         self.apf_session_start().await;
+        // Seize the HAL after the watchdog is up, so the fallback for anything the in-flight
+        // path declines to patch is already in place.
+        self.apf_inflight_start();
 
         // --bridge: enslave the guest-facing port only now, AFTER the hooks are live —
         // otherwise (direct especially) there's a window where the kernel bridge floods
@@ -646,6 +685,9 @@ impl Core {
         // the teardown's own vendor traffic (and anyone else's) can't queue one last
         // repatch against an interface that is going away.
         self.apf_session_stop();
+        // Detach from the HAL for the same reason: no in-flight rewrite for an interface on
+        // its way out.
+        self.apf_inflight_stop();
         // withdraw host routes + unmirror the bridge we put up0's IPs on
         self.withdraw_all_host_routes().await;
         self.remove_vmroute_rules().await;
@@ -681,11 +723,11 @@ impl Core {
         match VendorSocket::open() {
             Ok(s) => wd.sock = Some(s),
             Err(e) => {
-                log::error!("apf-watchdog: cannot open the nl80211 vendor socket: {e:#}");
+                log::error!("apf: cannot open the nl80211 vendor socket: {e:#}");
                 return;
             }
         }
-        log::info!("apf-watchdog: session up on ifindex {}", wd.ifindex);
+        log::info!("apf: vendor socket up on ifindex {}", wd.ifindex);
         self.apf_repatch("session init").await;
     }
 
@@ -694,10 +736,70 @@ impl Core {
     fn apf_session_stop(&mut self) {
         if let Some(wd) = &mut self.apf {
             if wd.sock.take().is_some() {
-                log::info!("apf-watchdog: session down");
+                log::info!("apf: vendor socket down");
             }
             wd.ifindex = 0;
             wd.failures = 0;
+        }
+    }
+
+    /// Session init for `--apf-inflight`: find the Wi-Fi HAL and seize it. Failure is logged
+    /// and non-fatal — the watchdog remains the safety net, so losing the in-flight path
+    /// costs the live window, not the feature.
+    fn apf_inflight_start(&mut self) {
+        if !self.apf_use_inflight || self.apf_inflight.is_some() {
+            return;
+        }
+        // Empty in DHCP mode until the first ACK; the tracer passes installs through until
+        // `set_guests` fills it in.
+        let guests = self.apf_guests().unwrap_or_default();
+        let started =
+            apf::inflight::find_wifi_hal().and_then(|pid| apf::inflight::spawn(pid, guests.clone()));
+        match started {
+            Ok(h) => {
+                log::info!(
+                    "apf-inflight: patching APF installs in flight on pid {} for {:?}",
+                    h.pid,
+                    guests
+                );
+                self.apf_inflight = Some(h);
+            }
+            Err(e) => log::error!(
+                "apf-inflight: not started ({e:#}) — APF installs go out unpatched; there is \
+                 no kprobe armed in this mode to repair them"
+            ),
+        }
+    }
+
+    /// Push the current address list to the tracer after a lease change, then correct the
+    /// program that is *already* installed. Without the second step a new DHCP guest would
+    /// wait for NetworkStack's next install, which can be minutes away.
+    async fn apf_inflight_guests_changed(&mut self, reason: &str) {
+        if !self.apf_use_inflight {
+            return;
+        }
+        let guests = self.apf_guests().unwrap_or_default();
+        if let Some(h) = &self.apf_inflight {
+            h.set_guests(guests.clone());
+            log::debug!("apf-inflight: guest list now {guests:?} ({reason})");
+        }
+        // One-shot repair of the live program. Uses the same vendor transaction as the
+        // watchdog method — this is the only place in-flight mode touches the firmware.
+        self.apf_repatch(reason).await;
+    }
+
+    /// Session teardown: detach from the HAL. Explicit rather than relying on drop order, so
+    /// the tracer is gone before the interface it was patching for.
+    fn apf_inflight_stop(&mut self) {
+        if let Some(mut h) = self.apf_inflight.take() {
+            let (seen, patched, already, passed) = h.counts();
+            h.shutdown();
+            log::info!(
+                // `passed` means "left unpatched": in this mode there is no watchdog behind
+                // it, so a nonzero count is the number of installs that went out stock.
+                "apf-inflight: session down — {seen} SET(s) seen, {patched} patched, \
+                 {already} already ours, {passed} left unpatched"
+            );
         }
     }
 
@@ -727,7 +829,7 @@ impl Core {
         let Some(guests) = guests else {
             // DHCP auto mode has no observed lease yet. Do not disable/read/write APF or
             // install an empty patch; the first validated DHCPACK queues the first patch.
-            log::debug!("apf-watchdog: {reason}: waiting for a DHCPACK lease");
+            log::debug!("apf: {reason}: waiting for a DHCPACK lease");
             return None;
         };
         let Some(wd) = &mut self.apf else { return None };
@@ -778,14 +880,25 @@ impl Core {
 
     /// Cold-start discovery only applies to the fixed allow-list: DHCP auto mode has no
     /// trusted IPv4 before an ACK, so probing a guessed lease would be a subnet scan.
+    /// Addresses that cold-start discovery should chase, from whichever method is active.
+    /// Both need them: the operator names an address but not its MAC, and the datapath cannot
+    /// forward to it until the binding is learned. Empty for the DHCP-derived watchdog mode,
+    /// where a lease supplies the MAC by definition.
+    fn apf_discovery_targets(&self) -> &[Ipv4Addr] {
+        match self.apf.as_ref().map(|wd| &wd.mode) {
+            Some(ApfWatchdogMode::Fixed(g)) => g,
+            _ => &[],
+        }
+    }
+
     fn probe_apf_watchdog_guests(&self) -> Result<usize> {
         if !self.initialized {
             return Ok(0);
         }
-        let Some(wd) = &self.apf else { return Ok(0) };
-        let ApfWatchdogMode::Fixed(guests) = &wd.mode else {
+        let guests = self.apf_discovery_targets();
+        if guests.is_empty() {
             return Ok(0);
-        };
+        }
         let Some(inj) = &self.probe_injector else {
             return Ok(0);
         };
@@ -801,7 +914,7 @@ impl Core {
             sent += 1;
         }
         if sent != 0 {
-            log::debug!("apf-watchdog: sent {sent} cold-start ARP discovery probe(s)");
+            log::debug!("apf: sent {sent} cold-start ARP discovery probe(s)");
         }
         Ok(sent)
     }
@@ -810,7 +923,9 @@ impl Core {
     /// 30-second heartbeat for an explicit guest that was offline at session start. A
     /// learned entry exits this path immediately and uses the ordinary aging probe instead.
     fn on_apf_discovery_tick(&mut self) -> Result<()> {
-        if !self.initialized || self.apf.is_none() {
+        // Runs for either method: `apf_discovery_targets` is what decides whether there is
+        // anything to chase.
+        if !self.initialized || self.apf_discovery_targets().is_empty() {
             return Ok(());
         }
         self.apf_discovery_ticks = self.apf_discovery_ticks.wrapping_add(1);
@@ -947,8 +1062,21 @@ impl Core {
         // immediately so the just-ACKed guest is demuxable before its first GARP/data frame.
         self.do_learn(IpAddr::V4(lease_ip), client_mac).await?;
         if changed {
-            log::info!("apf-watchdog: DHCPACK learned {lease_ip} -> {client_mac}; repatching APF");
-            self.apf_repatch("DHCPACK lease update").await;
+            if self.apf_use_inflight {
+                // In-flight mode: hand the new set to the tracer for future installs, and
+                // repair the currently installed program so the guest works now rather than
+                // at NetworkStack's next install.
+                log::info!(
+                    "apf: DHCPACK learned {lease_ip} -> {client_mac}; updating the in-flight \
+                     rule set and repairing the live program"
+                );
+                self.apf_inflight_guests_changed("DHCPACK lease update").await;
+            } else {
+                log::info!(
+                    "apf-watchdog: DHCPACK learned {lease_ip} -> {client_mac}; repatching APF"
+                );
+                self.apf_repatch("DHCPACK lease update").await;
+            }
         }
         Ok(())
     }

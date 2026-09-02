@@ -348,8 +348,9 @@ fn skip(p: &[u8], pc: &mut usize, n: usize, what: &str) -> Result<()> {
 }
 
 /// Read the one debugbuf reservation from an already-bounded program. Used by the patcher
-/// tests and by callers that have a program rather than a full 2048-byte work-memory read.
-#[cfg(test)]
+/// tests and by callers that have a program rather than a full 2048-byte work-memory read —
+/// notably [`super::inflight`], which sees only the program bytes inside the HAL's
+/// `sendmsg` buffer and never reads work memory over netlink.
 pub fn debugbuf_of(prog: &[u8]) -> Result<usize> {
     let insns = parse(prog)?;
     let dbg: Vec<&Insn> = insns

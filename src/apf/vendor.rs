@@ -18,36 +18,40 @@ const CTRL_CMD_GETFAMILY: u8 = 3;
 const CTRL_ATTR_FAMILY_ID: u16 = 1;
 const CTRL_ATTR_FAMILY_NAME: u16 = 2;
 
-const NLMSG_HDRLEN: usize = 16;
-const GENL_HDRLEN: usize = 4;
-const NLA_HDRLEN: usize = 4;
+pub(crate) const NLMSG_HDRLEN: usize = 16;
+pub(crate) const GENL_HDRLEN: usize = 4;
+pub(crate) const NLA_HDRLEN: usize = 4;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
-const NLM_F_REQUEST: u16 = 0x1;
+pub(crate) const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_ACK: u16 = 0x4;
-const NLA_F_NESTED: u16 = 0x8000;
+pub(crate) const NLA_F_NESTED: u16 = 0x8000;
 const NLA_TYPE_MASK: u16 = 0x3fff;
 
-const NL80211_CMD_VENDOR: u8 = 103;
-const NL80211_ATTR_IFINDEX: u16 = 3;
-const NL80211_ATTR_VENDOR_ID: u16 = 195;
-const NL80211_ATTR_VENDOR_SUBCMD: u16 = 196;
-const NL80211_ATTR_VENDOR_DATA: u16 = 197;
+pub(crate) const NL80211_CMD_VENDOR: u8 = 103;
+pub(crate) const NL80211_ATTR_IFINDEX: u16 = 3;
+pub(crate) const NL80211_ATTR_VENDOR_ID: u16 = 195;
+pub(crate) const NL80211_ATTR_VENDOR_SUBCMD: u16 = 196;
+pub(crate) const NL80211_ATTR_VENDOR_DATA: u16 = 197;
 
-const QCA_NL80211_VENDOR_ID: u32 = 0x0000_1374;
-const QCA_SUBCMD_PACKET_FILTER: u32 = 83;
+pub(crate) const QCA_NL80211_VENDOR_ID: u32 = 0x0000_1374;
+pub(crate) const QCA_SUBCMD_PACKET_FILTER: u32 = 83;
 
 // enum set_reset_packet_filter (qcacld-3.0 core/hdd/src/wlan_hdd_apf.c)
+/// Legacy "set filter" — what NetworkStack's `installPacketFilter` actually uses, as
+/// measured by a kprobe on `wlan_hdd_cfg80211_apf_offload`. Carries the whole program in
+/// `APF_ATTR_PACKET_SIZE`/`APF_ATTR_PROGRAM`, unlike WRITE.
+pub(crate) const APF_SET: u32 = 1;
 const APF_WRITE: u32 = 3;
 const APF_READ: u32 = 4;
 const APF_ENABLE: u32 = 5;
 const APF_DISABLE: u32 = 6;
 
-// enum qca_wlan_vendor_attr_packet_filter
-const APF_ATTR_SUBCMD: u16 = 1;
-const APF_ATTR_PACKET_SIZE: u16 = 4;
-const APF_ATTR_CURRENT_OFFSET: u16 = 5;
-const APF_ATTR_PROGRAM: u16 = 6;
+// enum qca_wlan_vendor_attr_packet_filter (qca-wifi-host-cmn os_if/linux/qca_vendor.h)
+pub(crate) const APF_ATTR_SUBCMD: u16 = 1;
+pub(crate) const APF_ATTR_PACKET_SIZE: u16 = 4;
+pub(crate) const APF_ATTR_CURRENT_OFFSET: u16 = 5;
+pub(crate) const APF_ATTR_PROGRAM: u16 = 6;
 const APF_ATTR_PROG_LEN: u16 = 7;
 
 /// `MAX_APF_MEMORY_LEN` (core/hdd/inc/wlan_hdd_apf.h): the driver's per-attribute cap.
@@ -341,7 +345,7 @@ fn needs_more_reply_data(need_ack: bool, saw_ack: bool, need_data: bool, have_da
 }
 
 /// One netlink attribute (TLV), 4-byte aligned. Header fields are native-endian.
-fn nla(typ: u16, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn nla(typ: u16, payload: &[u8]) -> Vec<u8> {
     let len = NLA_HDRLEN + payload.len();
     let mut v = Vec::with_capacity(align4(len));
     v.extend_from_slice(&(len as u16).to_ne_bytes());
@@ -354,11 +358,11 @@ fn nla(typ: u16, payload: &[u8]) -> Vec<u8> {
 }
 
 /// A u32 attribute. Netlink scalars are native-endian (unlike nftables' big-endian).
-fn nla_u32(typ: u16, val: u32) -> Vec<u8> {
+pub(crate) fn nla_u32(typ: u16, val: u32) -> Vec<u8> {
     nla(typ, &val.to_ne_bytes())
 }
 
-fn genl_msg(family: u16, flags: u16, seq: u32, cmd: u8, version: u8, attrs: &[u8]) -> Vec<u8> {
+pub(crate) fn genl_msg(family: u16, flags: u16, seq: u32, cmd: u8, version: u8, attrs: &[u8]) -> Vec<u8> {
     let total = NLMSG_HDRLEN + GENL_HDRLEN + attrs.len();
     let mut v = Vec::with_capacity(align4(total));
     v.extend_from_slice(&(total as u32).to_ne_bytes()); // nlmsg_len
@@ -374,6 +378,26 @@ fn genl_msg(family: u16, flags: u16, seq: u32, cmd: u8, version: u8, attrs: &[u8
         v.push(0);
     }
     v
+}
+
+/// One attribute located by offset rather than by slice: `(type, header_at, payload_at,
+/// payload_len)`. The in-flight patcher ([`super::inflight`]) rewrites `nla_len` headers in
+/// place, so it needs the offsets that [`parse_attrs`] discards. Same bounds discipline:
+/// stops at the first malformed entry, never panics.
+pub(crate) fn parse_attrs_at(buf: &[u8], base: usize, end: usize) -> Vec<(u16, usize, usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = base;
+    let end = end.min(buf.len());
+    while i + NLA_HDRLEN <= end {
+        let len = u16::from_ne_bytes(buf[i..i + 2].try_into().unwrap()) as usize;
+        let typ = u16::from_ne_bytes(buf[i + 2..i + 4].try_into().unwrap()) & NLA_TYPE_MASK;
+        if len < NLA_HDRLEN || i + len > end {
+            break;
+        }
+        out.push((typ, i, i + NLA_HDRLEN, len - NLA_HDRLEN));
+        i += align4(len);
+    }
+    out
 }
 
 /// Parse a flat attribute list. Stops at the first malformed entry (never panics, never
